@@ -1,0 +1,2501 @@
+// src/fsk441rx/app.rs — FSK441+ Transceiver GUI
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use eframe::egui;
+use std::path::PathBuf;
+use std::process::Command;
+use tokio::sync::mpsc;
+use chrono::{DateTime, Utc};
+
+mod params;
+mod audio;
+mod detector;
+mod demod;
+mod filter;
+mod store;
+mod geo;
+mod tx;
+mod qso;
+mod spectrum;
+mod accumulator;
+mod adif;
+mod analysis;
+
+use detector::run_detector;
+use demod::longx;
+use filter::ParsedMessage;
+use store::{Store, AnalysisPing};
+use adif::{AdifLogger, QsoRecord};
+use analysis::ThresholdSuggestion;
+use geo::{GeoValidator, PrefixDb, Qth};
+use tx::{TxCommand, PeriodTimer, Period, SlotState, HamlibUpdate};
+use spectrum::{compute_column, heat_color, FSK441_TONES_HZ, DISPLAY_BINS, hz_to_bin};
+use accumulator::{FragmentAccumulator, Fragment, AccumulatedDecode};
+use qso::{QsoState, on_decode, Transition};
+
+// ─── Audio device enumeration (matches MSK2K) ─────────────────────────────────
+
+fn enumerate_audio_devices() -> (Vec<String>, Vec<String>) {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    use std::collections::HashMap;
+    let host = cpal::default_host();
+
+    // Use host.devices() — sees all devices including duplicate USB CODECs on macOS
+    let device_list: Vec<cpal::Device> = {
+        let from_all = host.devices().map(|d| d.collect::<Vec<_>>()).unwrap_or_default();
+        if !from_all.is_empty() { from_all } else {
+            let mut devs: Vec<cpal::Device> = Vec::new();
+            if let Ok(d) = host.input_devices()  { devs.extend(d); }
+            if let Ok(d) = host.output_devices() { devs.extend(d); }
+            devs
+        }
+    };
+
+    let mut all_devices: Vec<(String, bool, bool)> = Vec::new();
+    for d in device_list {
+        if let Ok(name) = d.name() {
+            let has_in  = d.supported_input_configs().map(|mut c| c.next().is_some()).unwrap_or(false)
+                       || d.default_input_config().is_ok();
+            let has_out = d.supported_output_configs().map(|mut c| c.next().is_some()).unwrap_or(false)
+                       || d.default_output_config().is_ok();
+            all_devices.push((name, has_in, has_out));
+        }
+    }
+    all_devices.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Count duplicates — IC-9700 shows as two "USB Audio CODEC" entries, one RX one TX
+    let mut name_counts: HashMap<String, usize> = HashMap::new();
+    for (name, _, _) in &all_devices { *name_counts.entry(name.clone()).or_insert(0) += 1; }
+
+    let mut group_caps: HashMap<String, Vec<(bool, bool)>> = HashMap::new();
+    for (name, has_in, has_out) in &all_devices {
+        if name_counts[name.as_str()] > 1 {
+            group_caps.entry(name.clone()).or_default().push((*has_in, *has_out));
+        }
+    }
+
+    let mut name_indices: HashMap<String, usize> = HashMap::new();
+    let display_names: Vec<String> = all_devices.iter().map(|(name, has_in, has_out)| {
+        if name_counts[name.as_str()] > 1 {
+            let idx = name_indices.entry(name.clone()).or_insert(0);
+            *idx += 1;
+            let caps = &group_caps[name.as_str()];
+            let has_rx_sib = caps.iter().any(|(i, _)| *i);
+            let has_tx_sib = caps.iter().any(|(_, o)| *o);
+            let label = match (*has_in, *has_out) {
+                (true,  false) => "RX".to_string(),
+                (false, true)  => "TX".to_string(),
+                (true,  true)  => "RX/TX".to_string(),
+                (false, false) => {
+                    if has_rx_sib && !has_tx_sib { "TX".to_string() }
+                    else if has_tx_sib && !has_rx_sib { "RX".to_string() }
+                    else { format!("{}", idx) }
+                }
+            };
+            format!("{} ({})", name, label)
+        } else {
+            name.clone()
+        }
+    }).collect();
+
+    log::info!("[AUDIO] Devices: {:?}", display_names);
+    // Same list for both input and output — user picks the (RX) instance for input
+    // and the (TX) instance for output
+    (display_names.clone(), display_names)
+}
+
+// ─── Rig list from rigctld -l (matches MSK2K) ────────────────────────────────
+
+fn enumerate_rigs() -> Vec<(String, String)> {
+    let mut list = Vec::new();
+    // Try rigctld in PATH or bundled locations
+    for cmd in &["rigctld", "/usr/local/bin/rigctld", "/opt/homebrew/bin/rigctld"] {
+        if let Ok(out) = Command::new(cmd).arg("-l").output() {
+            if let Ok(text) = String::from_utf8(out.stdout) {
+                for line in text.lines() {
+                    if line.trim().is_empty() || line.starts_with(" Rig") { continue; }
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 3 {
+                        let id   = parts[0].to_string();
+                        let name = format!("{} {}", parts[1], parts[2]);
+                        list.push((id, name));
+                    }
+                }
+                if !list.is_empty() { break; }
+            }
+        }
+    }
+    list
+}
+
+fn enumerate_serial_ports() -> Vec<String> {
+    match serialport::available_ports() {
+        Ok(ports) => ports.iter().map(|p: &serialport::SerialPortInfo| p.port_name.clone()).collect::<Vec<_>>(),
+        Err(_)    => vec![],
+    }
+}
+
+// ─── Decode entry ─────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct DecodeEntry {
+    timestamp:   DateTime<Utc>,
+    df_hz:       f32,
+    ccf_ratio:   f32,
+    duration_ms: f32,
+    confidence: f32,
+    score:      u8,
+    raw:        String,
+    callsigns:  Vec<String>,
+    locator:    Option<String>,
+    report:     Option<String>,
+    is_cq:      bool,
+    char_confs: Vec<f32>,
+    is_accumulated: bool,
+    #[allow(dead_code)]
+    my_call:        String,
+    df_bin_hz:      Option<i32>,
+    passed_threshold: bool,  // false = shown only in RAW mode  // set for accumulated rows — used to update in place
+}
+
+enum EngineEvent { Decode(DecodeEntry), Accumulated(AccumulatedDecode), Hamlib(HamlibUpdate), Spectrum(Vec<f32>, f32), AnalysisSaved(i64, usize), ThresholdAnalysis(Box<ThresholdSuggestion>) }
+
+
+/// Find cty.dat — checks next to binary first, then ~/MSK2Ksoft, then current dir.
+fn default_cty_path() -> String {
+    // Next to the running binary
+    if let Ok(exe) = std::env::current_exe() {
+        let p = exe.parent().unwrap_or(std::path::Path::new(".")).join("cty.dat");
+        if p.exists() { return p.to_string_lossy().into_owned(); }
+    }
+    // ~/MSK2Ksoft/cty.dat (new project root)
+    if let Some(home) = dirs::home_dir() {
+        let p = home.join("MSK2Ksoft").join("cty.dat");
+        if p.exists() { return p.to_string_lossy().into_owned(); }
+        // ~/Desktop/MSK2Ksoft (old location — fallback)
+        let p2 = home.join("Desktop").join("MSK2Ksoft").join("cty.dat");
+        if p2.exists() { return p2.to_string_lossy().into_owned(); }
+    }
+    // Relative fallback
+    "cty.dat".into()
+}
+
+// ─── Settings ─────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct Settings {
+    #[allow(dead_code)]
+    my_call:        String,
+    my_loc:         String,
+    sel_in:         Option<String>,
+    sel_out:        Option<String>,
+    hamlib_enabled: bool,
+    their_call_hint: Option<String>,
+    station_tracker_enabled: bool,
+    station_min_pings:       usize,
+    rig_model:      String,
+    rig_port:       String,
+    rig_baud:       String,
+    period:         Period,
+    cty_path:       String,
+    max_km:         f64,
+    threshold:      f32,
+    min_ccf:        f32,
+    min_conf:       f32,
+    clear_accumulator: bool,  // pulse: engine clears frag_acc when true, resets to false
+    tx_level:       f32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            my_call:        "NOCALL".into(),
+            my_loc:         "IO82KM".into(),
+            sel_in:         Some("USB Audio CODEC".into()),
+            sel_out:        Some("USB Audio CODEC".into()),
+            hamlib_enabled: true,
+            their_call_hint: None,
+            station_tracker_enabled: true,
+            station_min_pings: 1,
+            rig_model:      String::new(),
+            rig_port:       String::new(),
+            rig_baud:       "19200".into(),
+            period:         Period::TxSecond,
+            cty_path:       default_cty_path(),
+            max_km:         3000.0,
+            threshold:      3.0,
+            min_ccf:        100.0,
+            min_conf:       0.45,
+            clear_accumulator: false,
+            tx_level:       0.8,
+        }
+    }
+}
+
+impl Settings {
+    fn audio_in(&self) -> Option<String> { self.sel_in.clone() }
+    fn audio_out(&self) -> Option<String> { self.sel_out.clone() }
+    fn hamlib_addr(&self) -> Option<String> {
+        if self.hamlib_enabled { Some("127.0.0.1:4532".into()) } else { None }
+    }
+}
+
+
+// Ensures rigctld is killed cleanly when app exits — same as MSK2K
+struct ProcessGuard(std::process::Child);
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        log::info!("[LAUNCHER] Shutting down rigctld (pid={})", self.0.id());
+        // Release PTT cleanly before killing
+        if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
+            &"127.0.0.1:4532".parse().unwrap(),
+            std::time::Duration::from_millis(500),
+        ) {
+            use std::io::Write;
+            let _ = stream.write_all(b"T 0\n");
+            let _ = stream.flush();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+
+// ─── Station Tracker ──────────────────────────────────────────────────────────
+// Persistently accumulates soft evidence across ALL pings at a given DF bin,
+// surviving slot boundaries. Shows running reconstruction in the callsign panel.
+#[derive(Default, Clone)]
+pub struct TrackedStation {
+    pub df_bin:     i32,        // DF rounded to nearest 43Hz bin
+    pub ping_count: usize,
+    pub last_seen:  Option<chrono::DateTime<chrono::Utc>>,
+    pub first_seen: Option<chrono::DateTime<chrono::Utc>>,
+    pub best_decode: String,    // highest-confidence single decode seen
+    pub best_conf:  f32,
+    pub callsigns:  Vec<(String, usize)>, // call → count
+}
+
+#[derive(Default)]
+pub struct StationTracker {
+    pub stations: Vec<TrackedStation>,
+}
+
+impl StationTracker {
+    pub fn add_ping(&mut self, entry: &DecodeEntry) {
+        let df_bin = (entry.df_hz / 43.0).round() as i32 * 43;
+        let st = if let Some(s) = self.stations.iter_mut().find(|s| s.df_bin == df_bin) {
+            s
+        } else {
+            self.stations.push(TrackedStation {
+                df_bin, ..Default::default()
+            });
+            self.stations.last_mut().unwrap()
+        };
+        st.ping_count += 1;
+        st.last_seen  = Some(entry.timestamp);
+        if st.first_seen.is_none() { st.first_seen = Some(entry.timestamp); }
+        // Keep best single-ping decode
+        if entry.confidence > st.best_conf && !entry.raw.trim().is_empty() {
+            st.best_conf   = entry.confidence;
+            st.best_decode = entry.raw.trim().to_string();
+        }
+        // Accumulate callsigns — merge fragments into longest known form
+        // e.g. I5Y + I5YD + I5YDI → all count under I5YDI
+        for call in &entry.callsigns {
+            // Check if this call is a prefix of an existing longer call
+            let existing_longer = st.callsigns.iter_mut()
+                .find(|(c,_)| c.starts_with(call.as_str()) && c.len() > call.len());
+            if let Some(e) = existing_longer {
+                e.1 += 1;
+                continue;
+            }
+            // Check if this call extends a shorter existing call
+            if let Some(e) = st.callsigns.iter_mut()
+                .find(|(c,_)| call.starts_with(c.as_str()) && call.len() > c.len())
+            {
+                let count = e.1 + 1;
+                let _ = std::mem::replace(e, (call.clone(), count));
+                continue;
+            }
+            // New callsign
+            if let Some(c) = st.callsigns.iter_mut().find(|(c,_)| c == call) {
+                c.1 += 1;
+            } else {
+                st.callsigns.push((call.clone(), 1));
+            }
+        }
+    }
+
+    pub fn clear(&mut self) { self.stations.clear(); }
+
+    // Stations active in last N seconds
+    pub fn active(&self, secs: i64) -> Vec<&TrackedStation> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(secs);
+        let mut active: Vec<&TrackedStation> = self.stations.iter()
+            .filter(|s| s.last_seen.map(|t| t > cutoff).unwrap_or(false))
+            .collect();
+        active.sort_by(|a, b| b.ping_count.cmp(&a.ping_count));
+        active
+    }
+}
+
+/// One entry in the DF scatter strip — a confirmed ping dot.
+#[derive(Clone)]
+struct DfDot {
+    col_idx:  usize,   // X: waterfall column index
+    df_hz:    f32,     // DF in Hz (signed)
+    ccf:      f32,     // CCF ratio — drives dot size
+    r: u8, g: u8, b: u8,
+}
+
+// ─── App ──────────────────────────────────────────────────────────────────────
+
+struct Fsk441App {
+    settings:        Settings,
+    settings_open:   bool,
+    in_devs:         Vec<String>,
+    out_devs:        Vec<String>,
+    rig_list:        Vec<(String, String)>,
+    rig_search:      String,
+    serial_ports:    Vec<String>,
+    decodes:         Vec<DecodeEntry>,
+    selected:        Option<usize>,
+    event_rx:        mpsc::UnboundedReceiver<EngineEvent>,
+    tx_cmd_tx:       mpsc::UnboundedSender<TxCommand>,
+    period_timer:    PeriodTimer,
+    is_transmitting: bool,
+    qso:             QsoState,
+    their_call_edit: String,
+    their_loc_edit:  String,
+    report_sent:     String,
+    report_rcvd:     String,
+    // Editable TX message fields — shown in UI, user can override defaults
+    tx_msgs:         [String; 6],  // [CQ, TX1, TX2, TX3, TX4, TX5]
+    tx_active:       std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // Spectrogram: columns[i] = one FFT snapshot (vertical strip), X=time Y=freq
+    #[allow(dead_code)]
+    show_accumulated: bool,
+    active_tx_idx:   Option<usize>,  // which TX button is active
+    wf_columns:      Vec<Vec<f32>>,
+    df_dots:         Vec<DfDot>,   // DF scatter strip history
+    wf_amplitude:    Vec<f32>,  // RMS amplitude per column (0..1)
+    wf_period_idx:   i64,  // slot index when columns last cleared
+    tx_msgs_key:     String,       // last key used to populate — repopulate only on change
+    qso_log:         Vec<String>,
+    seen_calls:      Vec<(String, chrono::DateTime<chrono::Utc>, usize)>,
+    #[allow(dead_code)]
+    station_tracker: StationTracker,
+    qso_summary:     Option<String>,
+    rig_freq_hz:     Option<u64>,
+    base_freq_hz:    Option<u64>,   // freq at first CAT connect — used for ±250KHz clamp
+    freq_edit:       String,         // KHz digits being typed (e.g. "385")
+    freq_editing:    bool,           // true when KHz field is active
+    cat_connected:   bool,
+    last_cat_rx:     Option<std::time::Instant>,
+    _runtime:        tokio::runtime::Runtime,
+    _rigctld:        Option<ProcessGuard>,
+    settings_watch_tx: tokio::sync::watch::Sender<Settings>,
+    analysis_save_tx:  mpsc::UnboundedSender<()>,
+    last_capture_id:   Option<(i64, usize)>,
+    qso_time_on:       Option<chrono::DateTime<chrono::Utc>>,
+    qso_logged:        bool,   // true after successful ADIF write — hides LOG button
+    adif_logger:       AdifLogger,
+    adif_log:          Vec<QsoRecord>,
+    last_analysis:     Option<Box<ThresholdSuggestion>>,  // latest optimiser result
+}
+
+impl Fsk441App {
+    fn new(_cc: &eframe::CreationContext) -> Self {
+        let settings = load_config();
+        let (in_devs, out_devs) = enumerate_audio_devices();
+        let rig_list = enumerate_rigs();
+        let serial_ports = enumerate_serial_ports();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all().build().expect("Tokio runtime");
+
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<EngineEvent>();
+        let (tx_cmd_tx, tx_cmd_rx) = mpsc::unbounded_channel::<TxCommand>();
+        let (hamlib_tx, hamlib_rx)   = mpsc::unbounded_channel::<HamlibUpdate>();
+
+        let s = settings.clone();
+        let (settings_watch_tx, settings_watch_rx) = tokio::sync::watch::channel(s.clone());
+        let (analysis_save_tx, analysis_save_rx) = mpsc::unbounded_channel::<()>();
+
+        let tx_engine = tx::TxEngine::new(
+            tx_cmd_rx, settings.period,
+            settings.audio_out(),
+            settings.hamlib_addr(),
+            hamlib_tx,
+        );
+        rt.spawn(async move { tx_engine.run().await; });
+
+        // Forward HamlibUpdates from TxEngine into main event loop
+        let htx = event_tx.clone();
+        rt.spawn(async move {
+            let mut hx = hamlib_rx;
+            while let Some(upd) = hx.recv().await {
+                let _ = htx.send(EngineEvent::Hamlib(upd));
+            }
+        });
+
+        // Spawn RX engine
+        let tx_active_for_engine = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tx_active_for_app    = tx_active_for_engine.clone();
+        let et = event_tx.clone();
+        rt.spawn(async move { run_engine(s, et, tx_active_for_engine, settings_watch_rx, analysis_save_rx).await; });
+
+        // Auto-launch rigctld if hamlib enabled and rig configured — same as MSK2K
+        let mut rigctld_guard: Option<ProcessGuard> = None;
+        if settings.hamlib_enabled
+            && !settings.rig_model.is_empty()
+            && !settings.rig_port.is_empty()
+        {
+            let baud: u32 = settings.rig_baud.parse().unwrap_or(19200);
+            log::info!("[LAUNCHER] Auto-starting rigctld: model={} port={} baud={}",
+                settings.rig_model, settings.rig_port, baud);
+            // Kill any stale instance before launching
+            let _ = Command::new("pkill").args(["-f", "rigctld"]).output();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            match Command::new("rigctld")
+                .args(["-m", &settings.rig_model,
+                       "-r", &settings.rig_port,
+                       "-s", &baud.to_string(),
+                       "-P", "RIG"])
+                .spawn()
+            {
+                Ok(c)  => {
+                    log::info!("[LAUNCHER] rigctld started (pid={})", c.id());
+                    rigctld_guard = Some(ProcessGuard(c));
+                }
+                Err(e) => log::error!("[LAUNCHER] rigctld failed: {}", e),
+            }
+            // Give rigctld time to bind port 4532
+            std::thread::sleep(std::time::Duration::from_millis(800));
+        }
+
+        let period = settings.period;
+        Self {
+            settings_open: false, in_devs, out_devs, rig_list,
+            rig_search: String::new(), serial_ports,
+            decodes: Vec::new(), selected: None, event_rx, tx_cmd_tx,
+            period_timer: PeriodTimer::new(period), is_transmitting: false,
+            qso: QsoState::Idle,
+            their_call_edit: String::new(), their_loc_edit: String::new(),
+            report_sent: "26".into(), report_rcvd: String::new(),
+            tx_active: tx_active_for_app,
+        show_accumulated: true,
+        active_tx_idx: None,
+        wf_columns: Vec::new(),
+        df_dots: Vec::new(),
+        analysis_save_tx,
+        last_capture_id: None,
+        qso_time_on: None,
+        qso_logged: false,
+        adif_logger: AdifLogger::new(&AdifLogger::default_path()),
+        adif_log: Vec::new(),
+        last_analysis: None,
+        wf_amplitude: Vec::new(),
+        wf_period_idx: -1,
+        tx_msgs: Default::default(), tx_msgs_key: String::new(), qso_log: Vec::new(), seen_calls: Vec::new(), station_tracker: StationTracker::default(), qso_summary: None, settings_watch_tx, rig_freq_hz: None,
+            base_freq_hz: None,
+            freq_edit: String::new(),
+            freq_editing: false, cat_connected: false, last_cat_rx: None, _rigctld: rigctld_guard, settings, _runtime: rt,
+        }
+    }
+
+    fn refresh_audio_devices(&mut self) {
+        let (i, o) = enumerate_audio_devices();
+        if let Some(ref sel) = self.settings.sel_in.clone() {
+            if !i.contains(sel) { self.settings.sel_in = None; }
+        }
+        if let Some(ref sel) = self.settings.sel_out.clone() {
+            if !o.contains(sel) { self.settings.sel_out = None; }
+        }
+        self.in_devs = i; self.out_devs = o;
+    }
+
+    fn poll_events(&mut self) {
+        while let Ok(event) = self.event_rx.try_recv() {
+            match event {
+                EngineEvent::Accumulated(acc) => {
+                    // Accumulated decode: prepend with ★ marker and different colour
+                    let entry = DecodeEntry {
+                        timestamp:   chrono::Utc::now(),
+                        df_hz:       0.0,
+                        duration_ms: 0.0,
+                        ccf_ratio:   acc.n_fragments as f32 * 100.0,
+                        confidence: acc.mean_conf,
+                        score:      70u8,  // always show accumulated — confidence shown in text
+                        raw:        format!("★ {}", acc.text),
+                        callsigns:  vec![],
+                        locator:    None,
+                        report:     None,
+                        is_cq:      acc.text.contains(" CQ ") || acc.text.starts_with("CQ "),
+                        char_confs: acc.char_conf,
+                        is_accumulated: true,
+                        my_call: self.settings.my_call.clone(),
+                        df_bin_hz: Some(acc.df_bin_hz),
+                        passed_threshold: true,
+                    };
+                    // Update seen callsigns — exclude MYCALL
+                    let my = self.settings.my_call.to_uppercase();
+                    for call in &entry.callsigns {
+                        if call.eq_ignore_ascii_case(&my) { continue; }
+                        if let Some(e) = self.seen_calls.iter_mut().find(|(c,_,_)| c == call) {
+                            e.2 += 1;
+                        } else {
+                            self.seen_calls.push((call.clone(), entry.timestamp, 1));
+                        }
+                    }
+
+                    // Update existing ★ row for this DF bin in place, or append
+                    let df_key = entry.df_bin_hz;
+                    if let Some(pos) = self.decodes.iter().position(|e|
+                        e.is_accumulated && e.df_bin_hz.is_some() && e.df_bin_hz == df_key
+                    ) {
+                        self.decodes[pos] = entry.clone();
+                    } else {
+                        self.decodes.push(entry.clone());
+                        if self.decodes.len() > 500 { self.decodes.remove(0); }
+                    }
+                    // DF scatter dot for accumulated entries
+                    let (dr,dg,db) = if entry.confidence >= 0.75 { (80,220,80) }
+                        else if entry.confidence >= 0.50 { (220,200,80) }
+                        else { (120,120,120) };
+                    self.df_dots.push(DfDot { col_idx: self.wf_columns.len(), df_hz: entry.df_hz, ccf: entry.ccf_ratio, r:dr,g:dg,b:db });
+                    if self.df_dots.len() > 2000 { self.df_dots.remove(0); }
+                    continue;
+                }
+                EngineEvent::ThresholdAnalysis(suggestion) => {
+                    self.last_analysis = Some(suggestion);
+                    continue;
+                }
+                EngineEvent::AnalysisSaved(capture_id, n) => {
+                    self.last_capture_id = Some((capture_id, n));
+                    log::info!("[UI] Analysis saved: capture={} n={}", capture_id, n);
+                    continue;
+                }
+                EngineEvent::Spectrum(bins, rms) => {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+                    let slot = now_ms / 30_000;
+                    if slot != self.wf_period_idx {
+                        self.wf_columns.clear();
+                        self.wf_amplitude.clear();
+                        self.wf_period_idx = slot;
+                        self.df_dots.clear(); // fresh each 30s slot
+                    }
+                    self.wf_columns.push(bins);
+                    self.wf_amplitude.push(rms);
+                    continue;
+                }
+                EngineEvent::Hamlib(upd) => {
+                    if let Some(f) = upd.freq {
+                        self.rig_freq_hz  = Some(f);
+                        if self.base_freq_hz.is_none() { self.base_freq_hz = Some(f); }
+                        self.cat_connected = true;
+                        self.last_cat_rx  = Some(std::time::Instant::now());
+                    }
+                    if let Some(false) = upd.connected {
+                        self.cat_connected = false;
+                        self.rig_freq_hz   = None;
+                    }
+                    if upd.transmitting != self.is_transmitting {
+                        self.is_transmitting = upd.transmitting;
+                        self.tx_active.store(upd.transmitting, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    continue;
+                }
+                EngineEvent::Decode(entry) => {
+                    // Discard loopback during TX
+                    if self.is_transmitting { continue; }
+            if self.qso.is_active() {
+                let parsed = ParsedMessage {
+                    raw: entry.raw.clone(), callsigns: entry.callsigns.clone(),
+                    locator: entry.locator.clone(), report: entry.report.clone(),
+                    is_cq: entry.is_cq, message_type: filter::MessageType::Garbage,
+                    validity_score: entry.score, valid_callsigns: entry.callsigns.clone(),
+                };
+                let mc = self.settings.my_call.clone();
+                let rs = self.report_sent.clone();
+                log::info!("[APP] on_decode: qso={:?} raw={}", std::mem::discriminant(&self.qso), parsed.raw);
+                let t  = on_decode(&mut self.qso, &parsed, &mc, move || rs.clone());
+                log::info!("[APP] on_decode result: {:?}", t);
+                match t {
+                    Transition::Auto(msg) => {
+                        self.qso_log.push(format!("AUTO: {}", msg));
+                        if let Some(tx_msg) = self.qso.tx_message() {
+                            let dev = self.settings.audio_out();
+                            let _ = self.tx_cmd_tx.send(TxCommand::Transmit { message: tx_msg, output_device: dev });
+                        }
+                    }
+                    Transition::Complete => {
+                        log::info!("[APP] HALT from Transition::Complete");
+                        self.qso_log.push("QSO COMPLETE — click LOG QSO".to_string());
+                        let _ = self.tx_cmd_tx.send(TxCommand::Halt);
+                        self.is_transmitting = false;
+                    }
+                    Transition::Count73(0) => {
+                        log::info!("[APP] HALT from Count73(0)");
+                        let _ = self.tx_cmd_tx.send(TxCommand::Halt);
+                        self.is_transmitting = false;
+                    }
+                    _ => {}
+                }
+            }
+            // Update seen callsigns
+            for call in &entry.callsigns {
+                // Merge fragments: I5Y / I5YD / I5YDI → longest form
+                let longer = self.seen_calls.iter_mut()
+                    .find(|(c,_,_)| c.starts_with(call.as_str()) && c.len() > call.len());
+                if let Some(e) = longer { e.2 += 1; continue; }
+                if let Some(e) = self.seen_calls.iter_mut()
+                    .find(|(c,_,_)| call.starts_with(c.as_str()) && call.len() > c.len())
+                {
+                    let (_, ts, n) = e.clone();
+                    *e = (call.clone(), ts, n + 1);
+                    continue;
+                }
+                if let Some(e) = self.seen_calls.iter_mut().find(|(c,_,_)| c == call) {
+                    e.2 += 1;
+                } else {
+                    self.seen_calls.push((call.clone(), entry.timestamp, 1));
+                }
+            }
+            // Update station tracker
+            if self.settings.station_tracker_enabled {
+                self.station_tracker.add_ping(&entry);
+            }
+            self.decodes.push(entry.clone());
+            if self.decodes.len() > 500 { self.decodes.remove(0); }
+            // DF scatter dot
+            let (dr,dg,db) = if entry.confidence >= 0.75 { (80,220,80) }
+                else if entry.confidence >= 0.50 { (220,200,80) }
+                else { (120,120,120) };
+            self.df_dots.push(DfDot { col_idx: self.wf_columns.len(), df_hz: entry.df_hz, ccf: entry.ccf_ratio, r:dr,g:dg,b:db });
+            if self.df_dots.len() > 2000 { self.df_dots.remove(0); }
+            } // end Decode arm
+            } // end match
+        }
+        // Filter — don't process decodes while transmitting (half duplex)
+        if self.is_transmitting { self.decodes.retain(|_| true); }
+    }
+
+    fn populate_tx_msgs(&mut self) {
+        let mc   = self.settings.my_call.clone();
+        let ml   = self.settings.my_loc.clone();
+        let tc   = self.their_call_edit.trim().to_uppercase();
+        let rs   = self.report_sent.clone();
+        let loc4 = ml[..ml.len().min(4)].to_string();
+
+        // Only repopulate when callsign/locator/report changes — preserve user edits
+        let key = format!("{},{},{},{},{}", mc, loc4, tc, rs, self.settings.my_loc);
+        if key == self.tx_msgs_key { return; }
+        self.tx_msgs_key = key;
+
+        // CQ format: "CQ MY_CALL MY_GRID4" (CQ first — standard FSK441)
+        self.tx_msgs[0] = format!("CQ {} {}", mc, loc4);
+        // TX1: THEIR_CALL MY_CALL (no locator)
+        self.tx_msgs[1] = if tc.is_empty() { format!("<CALL> {}", mc) }
+                          else { format!("{} {}", tc, mc) };
+        // TX2: THEIR_CALL MY_CALL REPORT REPORT
+        self.tx_msgs[2] = if tc.is_empty() { format!("<CALL> {} {} {}", mc, rs, rs) }
+                          else { format!("{} {} {} {}", tc, mc, rs, rs) };
+        // TX3: THEIR_CALL MY_CALL R MY_REPORT
+        self.tx_msgs[3] = if tc.is_empty() { format!("<CALL> {} R{} R{}", mc, rs, rs) }
+                          else { format!("{} {} R{} R{}", tc, mc, rs, rs) };
+        // TX4: RRRR RRRR MY_CALL (WSJT/MSHV standard)
+        self.tx_msgs[4] = format!("RRRR RRRR {}", mc);
+        // TX5: 73 73 73 MY_CALL
+        self.tx_msgs[5] = format!("73 73 73 {}", mc);
+    }
+
+    fn send_tx(&mut self, msg: &str) {
+        let dev = self.settings.audio_out();
+        let _ = self.tx_cmd_tx.send(TxCommand::Transmit {
+            message: msg.to_string(),
+            output_device: dev,
+        });
+        // Set tx_active immediately so detector/spectrum gate fires without UI lag
+        self.is_transmitting = true;
+        self.tx_active.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+
+    fn clear_decodes(&mut self) {
+        self.decodes.clear();
+        self.seen_calls.clear();
+        self.df_dots.clear();
+        self.qso_summary = None;
+        self.selected = None;
+    }
+
+    fn generate_qso_summary(&mut self) {
+        let tc = self.their_call_edit.trim().to_uppercase();
+        let tl = self.their_loc_edit.trim().to_uppercase();
+        let mc = self.settings.my_call.trim().to_uppercase();
+        let ml = self.settings.my_loc.trim().to_uppercase();
+        let rs = self.report_sent.trim().to_string();
+        let rr = self.report_rcvd.trim().to_string();
+        let their_pings: Vec<&DecodeEntry> = self.decodes.iter()
+            .filter(|e| e.callsigns.iter().any(|c| c.contains(&tc) || tc.contains(c.as_str())))
+            .collect();
+        let first_ping = their_pings.first()
+            .map(|e| e.timestamp.format("%H:%M:%S").to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let last_ping = their_pings.last()
+            .map(|e| e.timestamp.format("%H:%M:%S").to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let n_pings  = their_pings.len();
+        let peak_ccf = their_pings.iter().map(|e| e.ccf_ratio as u64).max().unwrap_or(0);
+        let now = chrono::Utc::now();
+        let summary = format!(
+            "QSO {}\n{} ↔ {}\nMy: {} Their: {}\nRpt: {} / {}\n{} pings {}-{}\nPeak CCF: {}",
+            now.format("%Y-%m-%d %H:%M UTC"),
+            mc, tc,
+            ml, if tl.is_empty() { "?".to_string() } else { tl },
+            if rs.is_empty() { "?".to_string() } else { rs },
+            if rr.is_empty() { "?".to_string() } else { rr },
+            n_pings, first_ping, last_ping,
+            peak_ccf,
+        );
+        log::info!("[QSO] Summary: {}", summary);
+        self.qso_summary = Some(summary);
+    }
+
+    fn export_qso_transcript(&self, rec: &QsoRecord) -> String {
+        let div = "─".repeat(62);
+        let mut out = String::new();
+        out.push_str(&format!("FSK441+ QSO Transcript
+"));
+        out.push_str(&format!("{} ↔ {}  |  {}  |  {:.3} MHz
+",
+            rec.station_callsign, rec.callsign,
+            if rec.qso_date.len() == 8 {
+                format!("{}-{}-{}", &rec.qso_date[0..4], &rec.qso_date[4..6], &rec.qso_date[6..8])
+            } else { rec.qso_date.clone() },
+            rec.freq_mhz.unwrap_or(144.370),
+        ));
+        out.push_str(&format!("{}
+", div));
+        out.push_str(&format!("{:<10} {:>7} {:>7}  Decode
+", "Time", "DF(Hz)", "Dur/S"));
+        out.push_str(&format!("{}
+", div));
+
+        // Filter decodes to this QSO — their callsign, within QSO timeframe
+        let their = rec.callsign.to_uppercase();
+        // Parse time_on/time_off from HHMMSS
+        let parse_t = |t: &str| -> Option<u32> {
+            if t.len() >= 4 {
+                let h: u32 = t[0..2].parse().ok()?;
+                let m: u32 = t[2..4].parse().ok()?;
+                let s: u32 = if t.len() >= 6 { t[4..6].parse().ok()? } else { 0 };
+                Some(h * 3600 + m * 60 + s)
+            } else { None }
+        };
+        let t_on  = parse_t(&rec.time_on).unwrap_or(0);
+        let t_off = parse_t(&rec.time_off).unwrap_or(86400);
+
+        let relevant: Vec<&DecodeEntry> = self.decodes.iter()
+            .filter(|e| !e.is_accumulated)
+            .filter(|e| {
+                // Time match — within QSO window
+                let es = e.timestamp.timestamp() % 86400;
+                let et = es as u32;
+                et >= t_on.saturating_sub(60) && et <= t_off + 60
+            })
+            .filter(|e|
+                // Contains their callsign or partial match
+                e.callsigns.iter().any(|c| c.contains(&their) || their.contains(c.as_str()))
+                || e.raw.to_uppercase().contains(&their[their.len().min(4)-4.min(their.len())..])
+            )
+            .collect();
+
+        // If no filtered results, include all pings in the time window
+        let pings: Vec<&DecodeEntry> = if relevant.is_empty() {
+            self.decodes.iter().filter(|e| !e.is_accumulated).filter(|e| {
+                let et = (e.timestamp.timestamp() % 86400) as u32;
+                et >= t_on.saturating_sub(60) && et <= t_off + 60
+            }).collect()
+        } else { relevant };
+
+        for e in &pings {
+            let strength = match e.ccf_ratio as u32 {
+                0..=49    => 1u32, 50..=99   => 2, 100..=199  => 3,
+                200..=399 => 4,   400..=799  => 5, 800..=1599  => 6,
+                1600..=3199 => 7, 3200..=6399 => 8, _ => 9,
+            };
+            let dur_str = if e.duration_ms > 0.0 {
+                format!("{:.0}/{}", e.duration_ms, strength)
+            } else { String::new() };
+            out.push_str(&format!("{:<10} {:>+7.0} {:>7}  {}
+",
+                e.timestamp.format("%H:%M:%S"), e.df_hz, dur_str, e.raw.trim()));
+        }
+
+        // Accumulated entries
+        let acc: Vec<&DecodeEntry> = self.decodes.iter()
+            .filter(|e| e.is_accumulated)
+            .collect();
+        if !acc.is_empty() {
+            out.push_str(&format!("{}
+", div));
+            for e in acc {
+                out.push_str(&format!("★ {:<10} {:>+7.0}  {}
+",
+                    e.timestamp.format("%H:%M:%S"), e.df_hz, e.raw.trim()));
+            }
+        }
+
+        out.push_str(&format!("{}
+", div));
+        out.push_str(&format!(
+            "QSO: {}Z → {}Z  |  Sent: {}  Rcvd: {}  |  {} pings  Peak CCF: {}
+",
+            if rec.time_on.len()>=4  { format!("{}:{}", &rec.time_on[0..2],  &rec.time_on[2..4])  } else { rec.time_on.clone() },
+            if rec.time_off.len()>=4 { format!("{}:{}", &rec.time_off[0..2], &rec.time_off[2..4]) } else { rec.time_off.clone() },
+            rec.rst_sent, rec.rst_rcvd, rec.nr_pings, rec.peak_ccf,
+        ));
+        if !rec.gridsquare.is_empty() {
+            out.push_str(&format!("Their grid: {}  My grid: {}
+",
+                rec.gridsquare, rec.my_gridsquare));
+        }
+        out.push_str(&format!("{}
+", div));
+        out.push_str(&format!("Generated by FSK441+  {}  {}
+",
+            rec.station_callsign, rec.my_gridsquare));
+        out
+    }
+
+    fn halt_tx(&mut self) {
+        log::info!("[APP] HALT from halt_tx()");
+        let _ = self.tx_cmd_tx.send(TxCommand::Halt);
+        self.is_transmitting = false;
+        // Ungate the audio fanout so spectrum and detector resume immediately
+        self.tx_active.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl eframe::App for Fsk441App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_events();
+        // Click on empty space in central panel deselects
+        if ctx.input(|i| i.pointer.any_click()) {
+            if !ctx.is_pointer_over_area() {
+                // pointer not over any egui widget — deselect
+            }
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+
+        // ── Top bar ───────────────────────────────────────────────────────
+        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                // FSK441 + callsign
+                ui.label(egui::RichText::new("FSK441")
+                    .strong().color(egui::Color32::from_rgb(0, 150, 255)));
+                ui.separator();
+                ui.label(egui::RichText::new(
+                    format!("{} {}", self.settings.my_call, self.settings.my_loc))
+                    .strong());
+                ui.separator();
+
+                // TX/RX slot countdown — always visible
+                {
+                    let (slot, remaining) = self.period_timer.current_slot();
+                    ui.label(match slot {
+                        SlotState::Tx => egui::RichText::new(format!("■ TX {:02}s", remaining))
+                            .color(egui::Color32::RED).strong(),
+                        SlotState::Rx => egui::RichText::new(format!("○ RX {:02}s", remaining))
+                            .color(egui::Color32::from_rgb(0, 200, 100)),
+                    });
+                    ui.separator();
+                }
+
+                // Frequency display with KHz digit tuning
+                // All elements in ONE horizontal line — ▲ digit ▼ side by side per digit
+                // Clamped to ±250KHz from base frequency (band-agnostic)
+                if self.cat_connected {
+                    if let Some(freq) = self.rig_freq_hz {
+                        let mhz     = freq / 1_000_000;
+                        let khz     = (freq % 1_000_000) / 1_000;
+                        let hz_part = (freq % 1_000) / 10;  // show as 2 digits
+                        let col     = egui::Color32::from_rgb(100, 200, 130);
+                        let col_dim = egui::Color32::from_rgb(60, 120, 80);
+                        let col_amb = egui::Color32::from_rgb(200, 150, 50);
+
+                        // ±250KHz clamp from base freq (set on first CAT connect)
+                        let base = self.base_freq_hz.unwrap_or(freq);
+                        let lo   = base.saturating_sub(250_000);
+                        let hi   = base + 250_000;
+
+                        let mut new_khz: Option<u64> = None;
+
+                        // Freq: "144." [editable KHz] ".000 MHz"
+                        // Click KHz field, type 3 digits, auto-QSY on 3rd digit or Enter
+                        // Out of range: clears and shows original
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.label(egui::RichText::new(format!("{}.", mhz))
+                            .monospace().size(14.0).color(col));
+
+                        if self.freq_editing {
+                            // Active TextEdit — amber, accepts digit input
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut self.freq_edit)
+                                    .desired_width(28.0)
+                                    .font(egui::TextStyle::Monospace)
+                                    .text_color(col_amb)
+                                    .frame(true)
+                            );
+                            // Grab focus immediately on first render
+                            if !resp.has_focus() { resp.request_focus(); }
+                            // Keep only digits, max 3
+                            self.freq_edit.retain(|c| c.is_ascii_digit());
+                            if self.freq_edit.len() > 3 { self.freq_edit.truncate(3); }
+
+                            // Commit on: 3rd digit entered, Enter, or focus lost
+                            let commit = (self.freq_edit.len() == 3 && resp.changed())
+                                || resp.lost_focus()
+                                || ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                            if commit {
+                                if self.freq_edit.len() == 3 {
+                                    if let Ok(new_k) = self.freq_edit.parse::<u64>() {
+                                        let new_f = mhz * 1_000_000 + new_k * 1_000;
+                                        if new_f >= lo && new_f <= hi {
+                                            new_khz = Some(new_f);
+                                        }
+                                    }
+                                }
+                                self.freq_edit.clear();
+                                self.freq_editing = false;
+                            }
+                            // Escape cancels
+                            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                                self.freq_edit.clear();
+                                self.freq_editing = false;
+                            }
+                        } else {
+                            // Idle — green label, click to start editing
+                            let r = ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{:03}", khz))
+                                        .monospace().size(14.0).color(col).strong()
+                                ).sense(egui::Sense::click())
+                            );
+                            if r.clicked() {
+                                self.freq_edit.clear();
+                                self.freq_editing = true;
+                            }
+                        }
+
+                        // ".000 MHz" suffix
+                        ui.label(egui::RichText::new(".")
+                            .monospace().size(14.0).color(col_dim));
+                        let hz_col = if hz_part == 0 { col_dim } else { col_amb };
+                        ui.label(egui::RichText::new(format!("{:02}", hz_part))
+                            .monospace().size(9.0).color(hz_col));
+                        ui.label(egui::RichText::new(" MHz")
+                            .monospace().size(14.0).color(col));
+
+                        if let Some(f) = new_khz {
+                            self.rig_freq_hz = Some(f);
+                            let _ = self.tx_cmd_tx.send(TxCommand::SetFreq(f));
+                        }
+                    }
+                } else {
+                    ui.label(egui::RichText::new("No CAT")
+                        .monospace().color(egui::Color32::GRAY));
+                }
+                ui.separator();
+
+                // Period selector inline
+                egui::ComboBox::from_id_salt("period_top")
+                    .width(80.0)
+                    .selected_text(match self.settings.period {
+                        Period::TxFirst    => "1st·30s",
+                        Period::TxSecond   => "2nd·30s",
+                        Period::TxFirst15  => "1st·15s",
+                        Period::TxSecond15 => "2nd·15s",
+                    })
+                    .show_ui(ui, |ui| {
+                        for (p, label) in [
+                            (Period::TxFirst,    "TX 1st 30s"),
+                            (Period::TxSecond,   "TX 2nd 30s"),
+                            (Period::TxFirst15,  "TX 1st 15s"),
+                            (Period::TxSecond15,  "TX 2nd 15s"),
+                        ] {
+                            if ui.selectable_value(&mut self.settings.period, p, label).clicked() {
+                                self.period_timer = PeriodTimer::new(p);
+                                let _ = self.tx_cmd_tx.send(TxCommand::SetPeriod(p));
+                                save_config(&self.settings);
+                            }
+                        }
+                    });
+                ui.separator();
+
+                // UTC clock only — countdown is shown in the TX/RX slot indicator above
+                let now_utc = chrono::Utc::now();
+                ui.label(egui::RichText::new(now_utc.format("%H:%M:%S").to_string())
+                    .monospace().color(egui::Color32::from_gray(200)));
+
+                // Settings far right
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("⚙ Settings").clicked() {
+                        self.settings_open = !self.settings_open;
+                        if self.settings_open { self.refresh_audio_devices(); }
+                    }
+                });
+            });
+        });
+
+        // ── QSO panel (bottom) ────────────────────────────────────────────
+        egui::TopBottomPanel::bottom("qso").min_height(190.0).show(ctx, |ui| {
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("Rpt Sent").color(egui::Color32::from_gray(220)));
+                    egui::ComboBox::from_id_salt("rpt_s")
+                        .width(55.0).selected_text(&self.report_sent)
+                        .show_ui(ui, |ui| {
+                            for r in &["26","27","28","29","36","37","47","57","59"] {
+                                if ui.selectable_value(&mut self.report_sent, r.to_string(), *r).clicked() {
+                                    self.tx_msgs_key.clear();
+                                }
+                            }
+                        });
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("Their Call").color(egui::Color32::from_gray(220)));
+                    // Lock fields when Their Call is set (QSO in progress)
+                    // Field: free-form entry, locked only when QSO active
+                    let field_locked = self.settings.their_call_hint.is_some();
+                    let edit_resp = ui.add(egui::TextEdit::singleline(&mut self.their_call_edit)
+                        .desired_width(80.0).hint_text("eg I5YDI")
+                        .interactive(!field_locked));
+                    if edit_resp.changed() {
+                        self.tx_msgs_key.clear();
+                        // Don't activate QSO mode on typing — wait for Set button
+                        // But clear hint if field emptied
+                        if self.their_call_edit.is_empty() {
+                            self.settings.their_call_hint = None;
+                            let _ = self.settings_watch_tx.send(self.settings.clone());
+                        }
+                    }
+                    if field_locked {
+                        // Show lock + click to unlock
+                        if ui.label(egui::RichText::new("🔒")
+                            .small().color(egui::Color32::YELLOW))
+                            .on_hover_text("Click ⟳ Clear to unlock")
+                            .clicked() {}
+                    } else {
+                        // Set button — activates QSO mode
+                        let call = self.their_call_edit.trim().to_uppercase();
+                        let set_btn = ui.add_enabled(
+                            !call.is_empty(),
+                            egui::Button::new(egui::RichText::new("Set")
+                                .color(egui::Color32::from_rgb(100,200,100)))
+                        );
+                        if set_btn.clicked() {
+                            self.settings.their_call_hint = Some(call);
+                            self.tx_msgs_key.clear();
+                            let _ = self.settings_watch_tx.send(self.settings.clone());
+                        }
+                    }
+                });
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("Their Loc").color(egui::Color32::from_gray(220)));
+                    ui.add(egui::TextEdit::singleline(&mut self.their_loc_edit)
+                        .desired_width(55.0).hint_text("JN53"));
+                });
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new("Rpt Rcvd").color(egui::Color32::from_gray(220)));
+                    ui.add(egui::TextEdit::singleline(&mut self.report_rcvd)
+                        .desired_width(40.0).hint_text("26"));
+                });
+            });
+
+            ui.add_space(5.0);
+            ui.separator();
+            ui.add_space(3.0);
+
+            // ── Editable TX message fields — WSJT style ───────────────────
+            // Auto-populate defaults from callsign/locator/report fields.
+            // User can edit any field freely before clicking its button.
+            self.populate_tx_msgs();
+
+            let labels = ["CQ", "TX1", "TX2", "TX3", "TX4", "TX5"];
+            let _active_idx: Option<usize> = match &self.qso {
+                QsoState::CallingCq { .. }     => Some(0),
+                QsoState::CallingStation { .. } => Some(1),
+                QsoState::SendingReport { .. }  => Some(2),
+                QsoState::SendingRReport { .. } => Some(3),
+                QsoState::SendingRR { .. }      => Some(4),
+                QsoState::Sending73 { .. }      => Some(5),
+                _                               => None,
+            };
+
+            ui.horizontal(|ui| {
+            // ── Left: TX button rows ──────────────────────────────────────
+            ui.vertical(|ui| {
+            for i in 0..6usize {
+                ui.horizontal(|ui| {
+                    let is_queued = self.active_tx_idx == Some(i);
+                    let is_txing  = self.is_transmitting && is_queued;
+                    let btn_color = if is_txing {
+                        egui::Color32::from_rgb(255, 80, 80)     // red = actively transmitting
+                    } else if is_queued {
+                        egui::Color32::from_rgb(255, 200, 0)     // amber = queued for next slot
+                    } else {
+                        egui::Color32::from_rgb(160, 160, 160)   // grey = idle
+                    };
+                    let btn = egui::Button::new(
+                        egui::RichText::new(labels[i]).strong().color(btn_color)
+                    ).min_size(egui::vec2(35.0, 0.0));
+
+                    if ui.add(btn).clicked() {
+                        let msg = self.tx_msgs[i].clone();
+                        // Don't transmit if message still has placeholder
+                        if msg.contains("<CALL>") {
+                            self.qso_log.push("⚠ Enter Their Call first".to_string());
+                        } else {
+                            log::info!("[APP] {} clicked: {}", labels[i], msg);
+                            self.qso_log.push(format!("{}: {}", labels[i], msg));
+                            if (i == 1 || i == 2) && self.qso_time_on.is_none() {
+                                self.qso_time_on = Some(chrono::Utc::now());
+                                self.qso_logged = false;
+                            }
+                            self.active_tx_idx = Some(i);
+                            self.send_tx(&msg);
+                            // TX5 = 73 sent — generate QSO summary
+                            if i == 5 {
+                                self.generate_qso_summary();
+                            }
+                        }
+                    }
+
+                    ui.add(egui::TextEdit::singleline(&mut self.tx_msgs[i])
+                        .desired_width(360.0)
+                        .font(egui::TextStyle::Monospace));
+
+                });
+            } // end TX rows for loop
+            }); // end left vertical
+
+            // ── Right: HALT/Clear + Accumulated decodes ───────────────────
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    if ui.button(
+                        egui::RichText::new("■ HALT").color(egui::Color32::RED).strong()
+                    ).clicked() {
+                        log::info!("[APP] HALT button clicked");
+                        self.halt_tx();
+                        self.active_tx_idx = None;
+                        self.qso = QsoState::Idle;
+                        self.qso_log.push("HALTED".to_string());
+                    }
+                    if ui.button(egui::RichText::new("⟳ Clear")
+                        .color(egui::Color32::from_gray(180))).clicked()
+                    {
+                        self.their_call_edit.clear();
+                        self.their_loc_edit.clear();
+                        self.report_rcvd = "26".to_string();
+                        self.active_tx_idx = None;
+                        self.tx_msgs_key.clear();
+                        self.halt_tx();
+                        self.qso = QsoState::Idle;
+                        self.settings.their_call_hint = None;
+                        let _ = self.settings_watch_tx.send(self.settings.clone());
+                        self.qso_time_on = None;
+                        self.qso_logged = false;
+                        self.qso_log.push("--- Cleared ---".to_string());
+                    }
+                    // LOG QSO button — state machine:
+                    //   can_log: call+time present, not yet logged
+                    //   qso_logged: show greyed "✓ Logged" briefly, then hide
+                    let can_log = !self.their_call_edit.trim().is_empty()
+                        && (self.qso_time_on.is_some()
+                            || matches!(&self.qso, QsoState::Complete { .. }))
+                        && !self.qso_logged;
+
+                    // Validate received report — must be a 2-digit number 26-59
+                    let rpt_valid = {
+                        let r = self.report_rcvd.trim();
+                        r.len() == 2 && r.chars().all(|c| c.is_ascii_digit())
+                            && r.parse::<u8>().map(|n| n >= 26 && n <= 59).unwrap_or(false)
+                    };
+
+                    if self.qso_logged {
+                        // Show confirmation + export button
+                        ui.label(egui::RichText::new("✓ Logged")
+                            .color(egui::Color32::from_rgb(80, 180, 80))
+                            .strong());
+                        if let Some(rec) = self.adif_log.last() {
+                            let rec = rec.clone();
+                            if ui.button(egui::RichText::new("📄 Export")
+                                .small().color(egui::Color32::from_gray(180)))
+                                .on_hover_text("Copy QSO transcript to clipboard").clicked()
+                            {
+                                let transcript = self.export_qso_transcript(&rec);
+                                // Write to file
+                                let mut path = dirs::home_dir().unwrap_or_default();
+                                path.push(".fsk441");
+                                path.push("transcripts");
+                                let _ = std::fs::create_dir_all(&path);
+                                let fname = format!("{}_{}.txt", rec.qso_date, rec.callsign);
+                                path.push(&fname);
+                                let _ = std::fs::write(&path, &transcript);
+                                // Also copy to clipboard
+                                ui.output_mut(|o| o.copied_text = transcript);
+                                self.qso_log.push(format!("📄 Transcript copied + saved: {}", fname));
+                            }
+                        }
+                    } else if can_log {
+                        if !rpt_valid {
+                            // Report missing/invalid — show inline edit + log button
+                            ui.label(egui::RichText::new("Rpt Rcvd:")
+                                .small().color(egui::Color32::from_rgb(255, 180, 50)));
+                            ui.add(egui::TextEdit::singleline(&mut self.report_rcvd)
+                                .desired_width(38.0)
+                                .hint_text("26-59")
+                                .font(egui::TextStyle::Monospace));
+                        }
+                        let btn_color = if rpt_valid {
+                            egui::Color32::from_rgb(50, 200, 80)
+                        } else {
+                            egui::Color32::from_gray(120)
+                        };
+                        let btn = ui.add_enabled(
+                            rpt_valid,
+                            egui::Button::new(
+                                egui::RichText::new("📋 LOG QSO").color(btn_color).strong()
+                            )
+                        ).on_hover_text(if rpt_valid {
+                            "Write QSO to ~/.fsk441/fsk441.adi"
+                        } else {
+                            "Enter received report (26-59) before logging"
+                        });
+                        if btn.clicked() {
+                            let now      = chrono::Utc::now();
+                            let time_on  = self.qso_time_on.unwrap_or(now);
+                            let callsign = self.their_call_edit.trim().to_uppercase();
+                            // Their grid: use edit field, or scan decode list for a locator
+                            let grid = {
+                                let from_edit = self.their_loc_edit.trim().to_uppercase();
+                                if !from_edit.is_empty() {
+                                    from_edit
+                                } else {
+                                    // Try to find a locator from decoded pings containing their call
+                                    self.decodes.iter()
+                                        .filter(|e| e.callsigns.iter().any(|c| c.contains(&callsign)))
+                                        .filter_map(|e| e.locator.clone())
+                                        .next()
+                                        .unwrap_or_default()
+                                }
+                            };
+                            // My grid: ensure full locator stored (e.g. IO82KM not IO82)
+                            let my_grid = {
+                                let loc = self.settings.my_loc.trim().to_uppercase();
+                                // Pad to at least 4 chars; use as-is if ≥4
+                                if loc.len() >= 4 { loc } else { format!("{}KM", loc) }
+                            };
+                            let rst_s    = self.report_sent.trim().to_string();
+                            // Clean received report — reject "73", require 2-digit RST
+                            let rst_r = {
+                                let r = self.report_rcvd.trim().to_string();
+                                let valid = r.len() == 2
+                                    && r.chars().all(|c| c.is_ascii_digit())
+                                    && r.parse::<u8>().map(|n| n >= 26 && n <= 59).unwrap_or(false);
+                                if valid { r } else { String::new() }
+                            };
+                            let freq_mhz = self.rig_freq_hz.map(|h| h as f64 / 1_000_000.0);
+                            let n_pings  = self.decodes.iter()
+                                .filter(|e| e.callsigns.iter().any(|c| c.contains(&callsign)))
+                                .count() as u32;
+                            let peak_ccf = self.decodes.iter()
+                                .filter(|e| e.callsigns.iter().any(|c| c.contains(&callsign)))
+                                .map(|e| e.ccf_ratio as u64).max().unwrap_or(0);
+                            let rec = QsoRecord {
+                                station_callsign: self.settings.my_call.trim().to_uppercase(),
+                                callsign:         callsign.clone(),
+                                qso_date:         time_on.format("%Y%m%d").to_string(),
+                                time_on:          time_on.format("%H%M%S").to_string(),
+                                time_off:         now.format("%H%M%S").to_string(),
+                                band:             "2M".to_string(),
+                                freq_mhz,
+                                mode:             "FSK441".to_string(),
+                                rst_sent:         rst_s.clone(),
+                                rst_rcvd:         rst_r.clone(),
+                                gridsquare:       grid,
+                                my_gridsquare:    my_grid,
+                                prop_mode:        "MS".to_string(),
+                                nr_pings:         n_pings,
+                                peak_ccf,
+                                comment:          format!("FSK441+ peak CCF={}", peak_ccf),
+                            };
+                            match self.adif_logger.append(&rec) {
+                                Ok(()) => {
+                                    self.adif_log.push(rec);
+                                    self.qso_logged = true;
+                                    self.qso_log.push(format!(
+                                        "✓ LOGGED: {} S:{} R:{} → fsk441.adi",
+                                        callsign, rst_s, rst_r));
+                                }
+                                Err(e) => { self.qso_log.push(format!("✗ Log failed: {}", e)); }
+                            }
+                            self.qso_time_on = None;
+                            self.qso = QsoState::Idle;
+                            // Clear accumulator for next station
+                            self.settings.clear_accumulator = true;
+                            let _ = self.settings_watch_tx.send(self.settings.clone());
+                            self.settings.clear_accumulator = false;
+                            self.decodes.retain(|e| !e.is_accumulated);
+                        }
+                    }
+                });
+
+                // ── Last Logged QSO ───────────────────────────────────────
+                ui.add_space(4.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Last QSO").strong()
+                        .color(egui::Color32::from_rgb(180, 200, 255)));
+                    if let Some(rec) = self.adif_log.last() {
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(&rec.callsign)
+                            .monospace().color(egui::Color32::from_rgb(100, 220, 100)).size(13.0));
+                        ui.add_space(4.0);
+                        let fmt = |t: &str| if t.len()>=4 { format!("{}:{}", &t[0..2], &t[2..4]) } else { t.to_string() };
+                        ui.label(egui::RichText::new(format!("{}-{}",
+                            fmt(&rec.time_on), fmt(&rec.time_off)))
+                            .small().color(egui::Color32::from_gray(140)));
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(format!("S:{} R:{}",
+                            rec.rst_sent, rec.rst_rcvd))
+                            .small().monospace().color(egui::Color32::from_rgb(255, 200, 80)));
+                        if !rec.gridsquare.is_empty() {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(&rec.gridsquare)
+                                .small().monospace().color(egui::Color32::from_gray(150)));
+                        }
+                    } else {
+                        ui.label(egui::RichText::new("None logged yet")
+                            .small().color(egui::Color32::from_gray(100)));
+                    }
+                });
+
+                ui.add_space(4.0);
+
+                // ── Accumulated decodes panel ─────────────────────────────
+                // Shows ★ rows: synthesised best-guess from multiple weak pings
+                // ── Accumulated decodes ──────────────────────────────────
+                // Only show entries with conf≥0.45 to suppress noise merges.
+                // In QSO mode, prefer entries at the QSO station's DF bin.
+                // Sort by confidence descending — best decode at top.
+                let their_hint = self.settings.their_call_hint.clone();
+                let mut acc_decodes: Vec<_> = self.decodes.iter()
+                    .filter(|e| e.is_accumulated && e.confidence >= 0.45)
+                    .cloned()
+                    .collect();
+                // Sort best confidence first
+                acc_decodes.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+                // In QSO mode, cap at 3 entries — too many is confusing
+                if their_hint.is_some() { acc_decodes.truncate(3); }
+
+                if !acc_decodes.is_empty() {
+                    ui.label(egui::RichText::new("★ Accumulated")
+                        .small().strong()
+                        .color(egui::Color32::from_rgb(220, 180, 50)));
+                    ui.separator();
+                    for e in &acc_decodes {
+                        ui.horizontal(|ui| {
+                            // Confidence bar
+                            let bar_w = (e.confidence * 60.0).clamp(2.0, 60.0);
+                            let bar_col = if e.confidence >= 0.75 {
+                                egui::Color32::from_rgb(80, 220, 80)
+                            } else if e.confidence >= 0.50 {
+                                egui::Color32::from_rgb(220, 180, 50)
+                            } else {
+                                egui::Color32::from_rgb(160, 160, 80)
+                            };
+                            let (bar_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(bar_w, 8.0), egui::Sense::hover()
+                            );
+                            ui.painter().rect_filled(bar_rect, 2.0, bar_col);
+                            ui.add_space(4.0);
+                            // Decoded text — strip ★ prefix
+                            let text = e.raw.trim_start_matches('★').trim();
+                            // Highlight text green if it contains their callsign
+                            let text_col = if their_hint.as_deref()
+                                .map(|h| text.to_uppercase().contains(h))
+                                .unwrap_or(false)
+                            {
+                                egui::Color32::from_rgb(80, 255, 120)
+                            } else {
+                                egui::Color32::from_rgb(255, 210, 80)
+                            };
+                            ui.label(egui::RichText::new(text)
+                                .monospace().small().color(text_col));
+                        });
+                        // Show DF bin + conf + time
+                        let df_str = e.df_bin_hz
+                            .map(|d| format!("{:+.0}Hz ", d))
+                            .unwrap_or_default();
+                        ui.label(egui::RichText::new(
+                            format!("{}conf {:.2}  {}",
+                                df_str, e.confidence,
+                                e.timestamp.format("%H:%M:%S")))
+                            .small().color(egui::Color32::from_gray(130)));
+                        ui.add_space(2.0);
+                    }
+                } else {
+                    ui.label(egui::RichText::new("No accumulated decodes yet")
+                        .small().color(egui::Color32::from_gray(80)));
+                }
+            }); // end right vertical
+            }); // end outer horizontal
+
+            ui.add_space(4.0);
+
+            if !self.qso_log.is_empty() {
+                ui.separator();
+                let start = self.qso_log.len().saturating_sub(4);
+                for e in &self.qso_log[start..] {
+                    ui.label(egui::RichText::new(e).small()
+                        .color(egui::Color32::from_rgb(160, 160, 160)));
+                }
+            }
+        });
+
+        // ── Decode list ───────────────────────────────────────────────────
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // ── Spectrogram: X=time (0..30s), Y=frequency (0..3kHz) ──────────
+            {
+                let wf_height = 150.0f32;
+                let avail_w   = ui.available_width();
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(avail_w, wf_height), egui::Sense::hover()
+                );
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(0, 0, 20));
+
+                let n_cols = self.wf_columns.len();
+                if n_cols > 0 {
+                    // Columns per period: period_secs * 11025 / 1024
+                    let period_secs = match self.settings.period {
+                        Period::TxFirst15 | Period::TxSecond15 => 15u32,
+                        _ => 30u32,
+                    };
+                    let max_cols = (period_secs * 11025 / 1024).max(1) as usize;
+                    // col_w fills exactly avail_w over the full period
+                    let col_w = avail_w / max_cols as f32;
+                    let bin_h = wf_height / DISPLAY_BINS as f32;
+
+                    for (ci, col) in self.wf_columns.iter().enumerate() {
+                        let x = rect.left() + ci as f32 * col_w;
+                        for (bi, &v) in col.iter().enumerate() {
+                            // bi=0 is DC (bottom), bi=DISPLAY_BINS-1 is 3kHz (top)
+                            // Invert: low freq at bottom, high freq at top
+                            let y = rect.bottom() - (bi as f32 + 1.0) * bin_h;
+                            if v > 0.05 {
+                                painter.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(x, y),
+                                        egui::vec2(col_w.max(1.5), bin_h.max(1.0)),
+                                    ),
+                                    0.0,
+                                    heat_color(v),
+                                );
+                            }
+                        }
+                    }
+
+                    // FSK441 tone markers — subtle dashed lines, low alpha
+                    // Drawn as short segments with gaps to avoid visual clutter
+                    let dash_len = 8.0f32;
+                    let gap_len  = 12.0f32;
+                    let step     = dash_len + gap_len;
+                    let tone_col = egui::Color32::from_rgba_unmultiplied(180, 160, 60, 55);
+                    for &hz in &FSK441_TONES_HZ {
+                        let bin = hz_to_bin(hz);
+                        let y = rect.bottom() - (bin as f32 + 0.5) * bin_h;
+                        let mut x = rect.left();
+                        while x < rect.right() {
+                            let x_end = (x + dash_len).min(rect.right());
+                            painter.line_segment(
+                                [egui::pos2(x, y), egui::pos2(x_end, y)],
+                                egui::Stroke::new(0.8, tone_col),
+                            );
+                            x += step;
+                        }
+                    }
+
+                    // Frequency axis labels (right edge, Y axis)
+                    for khz in [0u32, 500, 1000, 1500, 2000, 2500, 3000] {
+                        let bin = hz_to_bin(khz as f32);
+                        if bin >= DISPLAY_BINS { continue; }
+                        let y = rect.bottom() - bin as f32 * bin_h;
+                        painter.text(
+                            egui::pos2(rect.right() - 2.0, y),
+                            egui::Align2::RIGHT_CENTER,
+                            format!("{}k", khz / 1000),
+                            egui::FontId::monospace(8.0),
+                            egui::Color32::from_rgba_unmultiplied(180, 180, 180, 80),
+                        );
+                    }
+
+                    // Amplitude envelope trace — green line, dB scale
+                    // 40 dB dynamic range: noise floor at bottom, signals above
+                    if self.wf_amplitude.len() > 1 {
+                        let trace_h  = wf_height * 0.28;
+                        let baseline = rect.bottom();
+                        let db_range = 40.0f32; // dB shown (noise floor to top)
+
+                        // Estimate noise floor as 20th percentile of period so far
+                        let mut sorted = self.wf_amplitude.clone();
+                        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        let noise = sorted[sorted.len() / 5].max(1e-7);
+
+                        let mut pts: Vec<egui::Pos2> = Vec::with_capacity(n_cols);
+                        for (ci, &amp) in self.wf_amplitude.iter().enumerate() {
+                            let x  = rect.left() + ci as f32 * col_w + col_w * 0.5;
+                            let db = 20.0 * (amp / noise).log10(); // dB above noise floor
+                            let norm = (db / db_range).clamp(0.0, 1.0);
+                            let y  = baseline - norm * trace_h;
+                            pts.push(egui::pos2(x, y));
+                        }
+
+                        for i in 1..pts.len() {
+                            painter.line_segment(
+                                [pts[i-1], pts[i]],
+                                egui::Stroke::new(1.5,
+                                    egui::Color32::from_rgba_unmultiplied(0, 220, 80, 210)),
+                            );
+                        }
+
+                        // dB axis labels removed — not useful visually
+                    }
+
+                    // Time cursor — white vertical line at current position
+                    let x_now = rect.left() + n_cols as f32 * col_w;
+                    painter.line_segment(
+                        [egui::pos2(x_now, rect.top()), egui::pos2(x_now, rect.bottom())],
+                        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255,255,255,60)),
+                    );
+                }
+
+                painter.rect_stroke(rect, 0.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(60)));
+            }
+
+            // ── DF Scatter Strip: X=time (synced to waterfall), Y=DF ±500Hz ──
+            {
+                let strip_h  = 40.0f32;
+                let df_range = 500.0f32; // ±500 Hz maps to top/bottom
+                let avail_w  = ui.available_width();
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(avail_w, strip_h), egui::Sense::hover()
+                );
+                let painter = ui.painter_at(rect);
+                // Background
+                painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(0, 0, 15));
+
+                let period_secs = match self.settings.period {
+                    Period::TxFirst15 | Period::TxSecond15 => 15u32,
+                    _ => 30u32,
+                };
+                let max_cols = (period_secs * 11025 / 1024).max(1) as usize;
+                let col_w    = avail_w / max_cols as f32;
+                let _n_cols  = self.wf_columns.len();
+
+                // Zero line (df=0) — dim white
+                let y_zero = rect.top() + strip_h * 0.5;
+                painter.line_segment(
+                    [egui::pos2(rect.left(), y_zero), egui::pos2(rect.right(), y_zero)],
+                    egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255,255,255,25)),
+                );
+                // ±200 Hz guide lines — very dim
+                for df_guide in [-200.0f32, 200.0] {
+                    let y = rect.top() + strip_h * (0.5 - df_guide / (df_range * 2.0));
+                    painter.line_segment(
+                        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(100,100,100,30)),
+                    );
+                }
+
+                // Draw dots — size proportional to log(CCF), bright = high conf
+                for dot in &self.df_dots {
+                    let x = rect.left() + dot.col_idx as f32 * col_w;
+                    if x < rect.left() || x > rect.right() { continue; }
+                    let df_clamped = dot.df_hz.clamp(-df_range, df_range);
+                    let y = rect.top() + strip_h * (0.5 - df_clamped / (df_range * 2.0));
+                    // Radius: 2px base + log scale up to 6px at CCF=5000
+                    let r = (2.0 + (dot.ccf.max(1.0).ln() / 5000_f32.ln()) * 4.0).min(6.0);
+                    let alpha = if dot.ccf > 500.0 { 230u8 } else { 180u8 };
+                    painter.circle_filled(
+                        egui::pos2(x, y), r,
+                        egui::Color32::from_rgba_unmultiplied(dot.r, dot.g, dot.b, alpha),
+                    );
+                    // Vertical tick for strong signals (CCF>300) so clusters are visible
+                    if dot.ccf > 300.0 {
+                        painter.line_segment(
+                            [egui::pos2(x, y - r - 2.0), egui::pos2(x, y + r + 2.0)],
+                            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(dot.r, dot.g, dot.b, 80)),
+                        );
+                    }
+                }
+
+                // Y-axis labels
+                let label_col = egui::Color32::from_gray(80);
+                painter.text(egui::pos2(rect.right() - 38.0, rect.top() + 2.0),
+                    egui::Align2::LEFT_TOP, "+500Hz", egui::FontId::proportional(9.0), label_col);
+                painter.text(egui::pos2(rect.right() - 38.0, rect.bottom() - 11.0),
+                    egui::Align2::LEFT_TOP, "-500Hz", egui::FontId::proportional(9.0), label_col);
+                painter.text(egui::pos2(rect.right() - 22.0, y_zero - 5.0),
+                    egui::Align2::LEFT_TOP, "0", egui::FontId::proportional(9.0), label_col);
+
+                painter.rect_stroke(rect, 0.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(40)));
+            }
+
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Decoded Pings").strong()
+                    .color(egui::Color32::from_rgb(180, 200, 255)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+
+                    // Analysis ring buffer save — always active, always triggers
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new("💾 Save 30s").small()
+                            .color(egui::Color32::from_gray(160)))
+                        .small())
+                        .on_hover_text("Save last 30s of soft-bit data for analysis")
+                        .clicked()
+                    {
+                        let _ = self.analysis_save_tx.send(());
+                    }
+                    // Show last save confirmation as a dim label
+                    if let Some((_cid, n)) = self.last_capture_id {
+                        ui.label(egui::RichText::new(format!("✓{}p", n)).small()
+                            .color(egui::Color32::from_rgb(80, 180, 80)));
+                    }
+                    ui.separator();
+                    if ui.small_button("Clear").clicked() {
+                        self.clear_decodes();
+                        self.last_capture_id = None;
+                    }
+                });
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.monospace(format!("{:<10} {:>7} {:>7}  Decode",
+                    "Time", "DF(Hz)", "Dur/S"));
+            });
+            ui.separator();
+
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    for i in 0..self.decodes.len() {
+                        let e   = &self.decodes[i];
+                        if e.is_accumulated { continue; } // shown in QSO panel
+                        let sel = self.selected == Some(i);
+                        let _e_passed = e.passed_threshold;
+                        let _e_accum  = e.is_accumulated;
+
+                        // Dur/S: duration ms / MSHV-style strength 1-9
+                        // MSHV maps CCF to 1-9 on a doubling scale from threshold
+                        let dur_str = if e.duration_ms > 0.0 {
+                            let strength = match e.ccf_ratio as u32 {
+                                0..=49   => 1u32,
+                                50..=99  => 2,
+                                100..=199 => 3,
+                                200..=399 => 4,
+                                400..=799 => 5,
+                                800..=1599 => 6,
+                                1600..=3199 => 7,
+                                3200..=6399 => 8,
+                                _ => 9,
+                            };
+                            format!("{:.0}/{}", e.duration_ms, strength)
+                        } else { String::new() };
+                        let header = format!("{:<10} {:>+7.0} {:>7}  ",
+                            e.timestamp.format("%H:%M:%S"), e.df_hz, dur_str);
+
+                        // Render row with click detection via allocate_rect
+                        let row_start = ui.cursor().min;
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+
+                            // Selection highlight
+                            if sel {
+                                let r = ui.max_rect();
+                                ui.painter().rect_filled(r, 0.0,
+                                    egui::Color32::from_rgba_unmultiplied(255,255,255,18));
+                            }
+
+                            // Header in dim grey monospace
+                            ui.label(egui::RichText::new(&header)
+                                .monospace()
+                                .color(egui::Color32::from_gray(110)));
+
+                            // Render each character coloured by its confidence
+                            let chars: Vec<char> = e.raw.trim().chars().collect();
+                            let confs = &e.char_confs;
+                            let conf_thresh_bold = 0.5f32;
+                            let conf_thresh_show = 0.15f32;
+
+
+
+                            for (ci, ch) in chars.iter().enumerate() {
+                                let conf = confs.get(ci).copied().unwrap_or(0.0);
+                                let (r, g, b, bold) = if e.is_accumulated {
+                                    if conf >= conf_thresh_bold { (255u8, 200u8,  50u8, true) }
+                                    else if conf >= conf_thresh_show { (180u8, 140u8, 40u8, false) }
+                                    else { (100u8, 80u8, 30u8, false) }
+                                } else if conf >= conf_thresh_bold {
+                                    if e.score >= 80 { (80u8,  255u8,  80u8, true) }
+                                    else             { (200u8, 200u8,  60u8, true) }
+                                } else if conf >= conf_thresh_show {
+                                    (140u8, 140u8, 140u8, false)
+                                } else {
+                                    (70u8, 70u8, 70u8, false)
+                                };
+                                let rt = egui::RichText::new(ch.to_string())
+                                    .monospace()
+                                    .color(egui::Color32::from_rgb(r, g, b));
+                                let rt = if bold { rt.strong() } else { rt };
+                                ui.label(rt);
+                            }
+
+                            // 📋 Copy button — small, at end of row
+                            if ui.add(egui::Button::new(
+                                egui::RichText::new("⧉").size(9.0)
+                                    .color(egui::Color32::from_gray(100))
+                            ).frame(false).small()).on_hover_text("Copy decode to clipboard").clicked() {
+                                ui.output_mut(|o| o.copied_text = e.raw.trim().to_string());
+                            }
+                        });
+
+                        let in_qso = self.settings.their_call_hint.is_some();
+                        // Invisible clickable overlay across the full row
+                        let row_rect = egui::Rect::from_min_max(
+                            row_start,
+                            egui::pos2(ui.max_rect().right(), ui.cursor().min.y),
+                        );
+                        let resp = ui.allocate_rect(row_rect, egui::Sense::click_and_drag());
+
+                        // Right-click copies the full decode text
+                        resp.context_menu(|ui| {
+                            if ui.button("📋 Copy decode").clicked() {
+                                ui.output_mut(|o| o.copied_text = e.raw.trim().to_string());
+                                ui.close_menu();
+                            }
+                            if ui.button("📋 Copy with header").clicked() {
+                                ui.output_mut(|o| o.copied_text = format!(
+                                    "{} DF={:+.0} {}",
+                                    e.timestamp.format("%H:%M:%S"), e.df_hz, e.raw.trim()
+                                ));
+                                ui.close_menu();
+                            }
+                        });
+
+                        // Handle row click — second click deselects, click elsewhere deselects
+                        if (resp.clicked() || resp.secondary_clicked()) && !in_qso {
+                            if self.selected == Some(i) {
+                                self.selected = None;
+                                continue;
+                            }
+                            self.selected = Some(i);
+                            let my = self.settings.my_call.to_uppercase();
+                            let foreign: Vec<&String> = e.callsigns.iter()
+                                .filter(|c| !c.eq_ignore_ascii_case(&my))
+                                .collect();
+                            // Only auto-populate if exactly one foreign call — otherwise
+                            // user must click the individual callsign button below
+                            if foreign.len() == 1 {
+                                self.their_call_edit = foreign[0].clone();
+                                self.tx_msgs_key.clear();
+                            } else if foreign.is_empty() {
+                                if let Some(c) = e.callsigns.first() {
+                                    self.their_call_edit = c.clone();
+                                    self.tx_msgs_key.clear();
+                                }
+                            }
+                            if let Some(loc) = &e.locator { self.their_loc_edit = loc.clone(); }
+                            if let Some(rpt) = &e.report  { self.report_rcvd = rpt.clone(); }
+                        }
+
+                        // If multiple callsigns on this row, show small clickable call buttons
+                        // These appear when the row is selected, overlaid in a popup-style strip
+                        if sel && !in_qso {
+                            let my = self.settings.my_call.to_uppercase();
+                            let foreign: Vec<String> = e.callsigns.iter()
+                                .filter(|c| !c.eq_ignore_ascii_case(&my))
+                                .cloned()
+                                .collect();
+                            if foreign.len() > 1 {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("  → ").small()
+                                        .color(egui::Color32::YELLOW));
+                                    for call in &foreign {
+                                        if ui.add(egui::Button::new(
+                                            egui::RichText::new(call).small().monospace()
+                                                .color(egui::Color32::from_rgb(100, 200, 255))
+                                        ).small().frame(true)).clicked() {
+                                            self.their_call_edit = call.clone();
+                                            self.tx_msgs_key.clear();
+                                            if let Some(loc) = &e.locator {
+                                                self.their_loc_edit = loc.clone();
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                        }
+
+                        if resp.double_clicked() && e.is_cq && !self.their_call_edit.is_empty() {
+                            let mc = self.settings.my_call.clone();
+                            let ml = self.settings.my_loc.clone();
+                            let tc = self.their_call_edit.trim().to_uppercase();
+                            let tl = self.their_loc_edit.trim().to_uppercase();
+                            let rs = self.report_sent.clone();
+                            self.qso = QsoState::answer_cq(mc, ml, tc, tl, rs);
+                            let msg = self.qso.tx_message().unwrap_or_default();
+                            self.qso_log.push(format!("Answer CQ: {}", msg));
+                            self.send_tx(&msg);
+                        }
+
+                        // Highlight selected row
+                        if sel {
+                            ui.painter().rect_filled(
+                                ui.min_rect(),
+                                0.0,
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15),
+                            );
+                        }
+                    }
+                });
+        });
+
+        // ── Settings window (matches MSK2K layout) ────────────────────────
+        if self.settings_open {
+            egui::Window::new("⚙ Settings")
+                .collapsible(false).resizable(true).default_width(450.0)
+                .show(ctx, |ui| {
+
+                    // ── Station Setup ─────────────────────────────────────
+                    ui.heading("Station Setup");
+                    ui.horizontal(|ui| {
+                        ui.label("My Callsign:");
+                        if ui.text_edit_singleline(&mut self.settings.my_call).changed() {
+                            self.settings.my_call = self.settings.my_call.to_uppercase();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("My Locator: ");
+                        if ui.text_edit_singleline(&mut self.settings.my_loc).changed() {
+                            self.settings.my_loc = self.settings.my_loc.to_uppercase();
+                        }
+                    });
+
+                    // ── Rig Control ───────────────────────────────────────
+                    ui.separator();
+                    ui.heading("Rig Control (Hamlib)");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.settings.hamlib_enabled, "Enable CAT Control");
+                    });
+
+                    if self.settings.hamlib_enabled {
+                        ui.indent("cat", |ui| {
+                            egui::Grid::new("rig_grid")
+                                .num_columns(2).spacing([10.0, 8.0])
+                                .show(ui, |ui| {
+
+                                ui.label("Rig Selection:");
+                                ui.vertical(|ui| {
+                                    ui.text_edit_singleline(&mut self.rig_search)
+                                        .on_hover_text("Type model number to filter (e.g. 9700)");
+                                    let cur = if self.settings.rig_model.is_empty() {
+                                        "Select Rig...".to_string()
+                                    } else {
+                                        self.rig_list.iter()
+                                            .find(|(id, _)| id == &self.settings.rig_model)
+                                            .map(|(_, n)| n.clone())
+                                            .unwrap_or_else(|| format!("ID: {}", self.settings.rig_model))
+                                    };
+                                    egui::ComboBox::from_id_salt("rig_sel")
+                                        .selected_text(cur).width(250.0)
+                                        .show_ui(ui, |ui| {
+                                            let srch = self.rig_search.to_uppercase();
+                                            for (id, name) in &self.rig_list.clone() {
+                                                if srch.is_empty()
+                                                    || name.to_uppercase().contains(&srch)
+                                                    || id.contains(&srch)
+                                                {
+                                                    ui.selectable_value(
+                                                        &mut self.settings.rig_model,
+                                                        id.clone(), name);
+                                                }
+                                            }
+                                        });
+                                });
+                                ui.end_row();
+
+                                ui.label("Serial Port:");
+                                ui.horizontal(|ui| {
+                                    let port_disp = if self.settings.rig_port.is_empty() {
+                                        "Select Port...".to_string()
+                                    } else {
+                                        self.settings.rig_port.clone()
+                                    };
+                                    egui::ComboBox::from_id_salt("ser_port")
+                                        .selected_text(&port_disp).width(280.0)
+                                        .show_ui(ui, |ui| {
+                                            for p in &self.serial_ports.clone() {
+                                                ui.selectable_value(
+                                                    &mut self.settings.rig_port, p.clone(), p);
+                                            }
+                                        });
+                                    if ui.button("🔄").clicked() {
+                                        self.serial_ports = enumerate_serial_ports();
+                                    }
+                                });
+                                ui.end_row();
+
+                                ui.label("Baud Rate:");
+                                ui.text_edit_singleline(&mut self.settings.rig_baud);
+                                ui.end_row();
+                            });
+                        });
+                        ui.label(egui::RichText::new(
+                            "Start rigctld before launching FSK441, e.g:\n  rigctld -m 3081 -r /dev/cu.usbserial-XXX -s 19200")
+                            .small().color(egui::Color32::GRAY));
+                    }
+
+                    // ── Audio Hardware ────────────────────────────────────
+                    ui.separator();
+                    ui.heading("Audio Hardware");
+                    ui.horizontal(|ui| {
+                        if ui.button("🔄 Refresh Devices")
+                            .on_hover_text("Re-scan audio hardware. Use after swapping USB radios.")
+                            .clicked()
+                        {
+                            self.refresh_audio_devices();
+                        }
+                        if self.settings.sel_in.is_none() || self.settings.sel_out.is_none() {
+                            ui.label(egui::RichText::new("⚠ No device selected")
+                                .small().color(egui::Color32::from_rgb(255, 180, 0)));
+                        }
+                    });
+
+                    ui.add_space(4.0);
+                    ui.label("Input Device:");
+                    egui::ComboBox::from_id_salt("in_dev")
+                        .selected_text(self.settings.sel_in.clone()
+                            .unwrap_or_else(|| "Default".into()))
+                        .width(300.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.settings.sel_in, None, "Default");
+                            for d in &self.in_devs.clone() {
+                                ui.selectable_value(
+                                    &mut self.settings.sel_in, Some(d.clone()), d);
+                            }
+                        });
+
+                    ui.add_space(8.0);
+                    ui.label("Output Device:");
+                    egui::ComboBox::from_id_salt("out_dev")
+                        .selected_text(self.settings.sel_out.clone()
+                            .unwrap_or_else(|| "Default".into()))
+                        .width(300.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.settings.sel_out, None, "Default");
+                            for d in &self.out_devs.clone() {
+                                ui.selectable_value(
+                                    &mut self.settings.sel_out, Some(d.clone()), d);
+                            }
+                        });
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label("TX Level:");
+                        ui.add(egui::Slider::new(&mut self.settings.tx_level, 0.0..=1.0)
+                            .custom_formatter(|v, _| format!("{}%", (v * 100.0).round() as i32)));
+                    });
+
+                    // ── Filtering ─────────────────────────────────────────
+                    ui.separator();
+                    ui.heading("Filtering");
+                    egui::Grid::new("filt").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                        ui.label("cty.dat path:"); ui.text_edit_singleline(&mut self.settings.cty_path); ui.end_row();
+                        ui.label("Max range (km):"); ui.add(egui::Slider::new(&mut self.settings.max_km, 500.0..=5000.0).integer()); ui.end_row();
+                        ui.label("Min CCF ratio:"); ui.add(egui::Slider::new(&mut self.settings.min_ccf, 30.0..=500.0).integer()); ui.end_row();
+                        ui.label("Min confidence:"); ui.add(egui::Slider::new(&mut self.settings.min_conf, 0.35..=0.90)); ui.end_row();
+                        ui.end_row();
+                        // Optimiser suggestion
+                        ui.label("");
+                        if let Some(ref s) = self.last_analysis {
+                            if s.is_improvement() {
+                                ui.vertical(|ui| {
+                                    ui.label(egui::RichText::new(format!(
+                                        "Optimiser: CCF≥{:.0}+conf≥{:.2} | CCF≥{:.0}+conf≥{:.2}  F1 {:.2}→{:.2}",
+                                        s.suggested_arm1_ccf, s.suggested_arm1_conf,
+                                        s.suggested_arm2_ccf, s.suggested_arm2_conf,
+                                        s.current_f1, s.suggested_f1,
+                                    )).small().color(egui::Color32::from_rgb(100, 220, 100)));
+                                    if ui.small_button("✓ Apply").clicked() {
+                                        self.settings.min_ccf  = s.suggested_arm1_ccf;
+                                        self.settings.min_conf = s.suggested_arm1_conf;
+                                        let _ = self.settings_watch_tx.send(self.settings.clone());
+                                    }
+                                });
+                            } else {
+                                ui.label(egui::RichText::new(format!(
+                                    "Optimiser: thresholds near-optimal (F1={:.2}, {:.0}h, {}sig/{}noise)",
+                                    s.current_f1, s.window_hours, s.n_signal_pings, s.n_noise_pings
+                                )).small().color(egui::Color32::from_gray(110)));
+                            }
+                        } else {
+                            ui.label(egui::RichText::new("Optimiser: runs every 30min once signals seen")
+                                .small().color(egui::Color32::from_gray(100)));
+                        }
+                        ui.end_row();
+                    });
+
+                    ui.separator();
+                    if ui.button("Save & Close").clicked() {
+                        self.settings_open = false;
+                        save_config(&self.settings);
+                        // Apply changes to running TxEngine immediately
+                        let _ = self.tx_cmd_tx.send(TxCommand::SetPeriod(self.settings.period));
+                        self.period_timer = PeriodTimer::new(self.settings.period);
+                        let _ = self.tx_cmd_tx.send(TxCommand::SetOutputDevice(self.settings.audio_out()));
+                        let _ = self.tx_cmd_tx.send(TxCommand::SetHamlib(self.settings.hamlib_addr()));
+                        // Kill existing rigctld if hamlib disabled
+                        if !self.settings.hamlib_enabled {
+                            std::process::Command::new("pkill").args(["-f", "rigctld"]).spawn().ok();
+                            log::info!("[LAUNCHER] Hamlib disabled — killed rigctld");
+                        }
+                    }
+                });
+        }
+    }
+}
+
+// ─── Engine ───────────────────────────────────────────────────────────────────
+
+async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEvent>, tx_active: std::sync::Arc<std::sync::atomic::AtomicBool>, mut settings_rx: tokio::sync::watch::Receiver<Settings>, mut analysis_save_rx: mpsc::UnboundedReceiver<()>) {
+    let mut settings = settings; // mutable local copy
+
+    let qth = Qth::from_maidenhead(&settings.my_loc).unwrap_or_default();
+    let db  = PrefixDb::load(&PathBuf::from(&settings.cty_path));
+    let geo = GeoValidator::new(db, qth, settings.max_km);
+    // Use ~/.fsk441/fsk441.db — don't exit on failure, just log and continue
+    let db_path = {
+        let mut p = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        p.push(".fsk441");
+        std::fs::create_dir_all(&p).ok();
+        p.push("fsk441.db");
+        p
+    };
+    let store_opt = match Store::open(&db_path) {
+        Ok(s) => { log::info!("[DB] Opened {:?}", db_path); Some(s) }
+        Err(e) => { log::warn!("[DB] Cannot open {:?}: {} — continuing without DB", db_path, e); None }
+    };
+    let store = store_opt;
+    let session_id = store.as_ref().and_then(|s|
+        s.new_session(Some(settings.sel_in.as_deref().unwrap_or("default")), None).ok()
+    ).unwrap_or(0);
+
+    // Two channels from audio: one for detector, one for spectrum
+    let (audio_tx,      audio_rx)      = mpsc::unbounded_channel::<Vec<f32>>();
+    let (audio_spec_tx, mut audio_spec_rx) = mpsc::unbounded_channel::<Vec<f32>>();
+    let (ping_tx, mut ping_rx) = mpsc::unbounded_channel::<detector::DetectedPing>();
+
+    if let Err(e) = audio::start_live(settings.audio_in(), audio_tx).await {
+        log::error!("[ENGINE] Audio: {}", e); return;
+    }
+
+    // Fan out raw audio to detector AND spectrum computer
+    let spec_tx2 = event_tx.clone();
+    #[allow(unused_variables)]
+    let tx_active_spec = tx_active.clone();
+    tokio::spawn(async move {
+        let mut planner = rustfft::FftPlanner::<f32>::new();
+        let mut _chunk_count = 0u64;
+        while let Some(chunk) = audio_spec_rx.recv().await {
+            // Every audio chunk = one column — 1024/11025 = ~93ms per column
+            let rms = {
+                let sum: f32 = chunk.iter().map(|&s| s * s).sum();
+                (sum / chunk.len() as f32).sqrt()
+            };
+            let bins = compute_column(&chunk, &mut planner);
+            let _ = spec_tx2.send(EngineEvent::Spectrum(bins, rms));
+        }
+    });
+
+    // Fan audio to detector and spectrum — gate both on tx_active
+    let (fanout_ping_tx, fanout_ping_rx) = mpsc::unbounded_channel::<Vec<f32>>();
+    let tx_active_fanout = tx_active.clone();
+    tokio::spawn(async move {
+        let mut rx = audio_rx;
+        while let Some(chunk) = rx.recv().await {
+            if !tx_active_fanout.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = audio_spec_tx.send(chunk.clone());
+                let _ = fanout_ping_tx.send(chunk);
+            }
+        }
+    });
+
+    tokio::spawn(run_detector(fanout_ping_rx, ping_tx, settings.threshold, params::DEFAULT_DFTOL));
+
+    let mut frag_acc = FragmentAccumulator::new();
+    let mut current_slot_idx: i64 = -1;
+    // Analysis ring buffer: rolling 30s of soft-bit data, written on demand
+    const RING_MAX: usize = 300; // ~300 pings max in 30s
+    let mut analysis_ring: std::collections::VecDeque<AnalysisPing> = std::collections::VecDeque::with_capacity(RING_MAX);
+    // Background optimiser: run every 30 minutes
+    let mut last_optimiser_run = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(25 * 60))  // run ~5min after start
+        .unwrap_or(std::time::Instant::now());
+    let optimiser_db_path = {
+        let mut p = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        p.push(".fsk441"); p.push("fsk441.db");
+        p.to_string_lossy().to_string()
+    };
+    // Brief startup delay — allow audio stream to stabilise before accepting pings
+    let engine_start = std::time::Instant::now();
+    const STARTUP_MS: u128 = 3000;
+    let mut tx_cooldown_until: Option<std::time::Instant> = None;
+
+    while let Some(ping) = ping_rx.recv().await {
+        let is_tx = tx_active.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Check for analysis save request (non-blocking)
+        if analysis_save_rx.try_recv().is_ok() {
+            if let Some(ref s) = store {
+                let entries: Vec<AnalysisPing> = analysis_ring.iter().cloned().collect();
+                let n = entries.len();
+                match s.save_analysis(&entries) {
+                    Ok(cid) => { let _ = event_tx.send(EngineEvent::AnalysisSaved(cid, n)); }
+                    Err(e)  => log::error!("[DB] save_analysis failed: {}", e),
+                }
+            } else {
+                log::warn!("[DB] Cannot save analysis — no DB connection");
+            }
+        }
+
+        // Background threshold optimiser — every 30 minutes
+        if last_optimiser_run.elapsed() >= std::time::Duration::from_secs(30 * 60) {
+            last_optimiser_run = std::time::Instant::now();
+            let db = optimiser_db_path.clone();
+            let et = event_tx.clone();
+            let (a1c, a1f, a2c, a2f) = (
+                settings.min_ccf, settings.min_conf, 25.0f32, 0.75f32,
+            );
+            // Spawn blocking task so it doesn't block the audio loop
+            tokio::task::spawn_blocking(move || {
+                match analysis::run_optimiser(&db, 24.0, a1c, a1f, a2c, a2f) {
+                    Ok(s)  => { let _ = et.send(EngineEvent::ThresholdAnalysis(Box::new(s))); }
+                    Err(e) => { log::debug!("[ANALYSIS] Skipped: {}", e); }
+                }
+            });
+        }
+
+        // Pull latest settings if changed (their_call_hint, period, etc.)
+        if settings_rx.has_changed().unwrap_or(false) {
+            let old_hint = settings.their_call_hint.clone();
+            settings = settings_rx.borrow_and_update().clone();
+
+            // Clear accumulator pulse — fired from LOG QSO button
+            if settings.clear_accumulator {
+                frag_acc.clear();
+                frag_acc.clear_constraint();
+                log::info!("[ACCUM] Cleared between QSOs");
+            }
+
+            // Sync QSO context constraint with their_call_hint
+            match (&old_hint, &settings.their_call_hint) {
+                (None, Some(their)) => {
+                    // QSO just started — apply constraint
+                    frag_acc.set_constraint(&settings.my_call, their);
+                }
+                (Some(_), None) => {
+                    // QSO ended — clear constraint
+                    frag_acc.clear_constraint();
+                }
+                (Some(old), Some(new)) if old != new => {
+                    // Their call changed mid-QSO (unlikely but handle it)
+                    frag_acc.set_constraint(&settings.my_call, new);
+                }
+                _ => {}
+            }
+        }
+
+        // Drain any pings that queued during TX — they are our own audio
+        if is_tx {
+            frag_acc.prune_older_than(300); // housekeeping during TX
+            // Set cooldown so we reject ring-buffer bleed after TX ends
+            tx_cooldown_until = Some(std::time::Instant::now()
+                + std::time::Duration::from_millis(1500));
+            frag_acc.clear();
+            while ping_rx.try_recv().is_ok() {}
+            continue;
+        }
+
+        // Reject pings during cooldown after TX (loopback tail)
+        if let Some(until) = tx_cooldown_until {
+            if std::time::Instant::now() < until {
+                continue;
+            } else {
+                tx_cooldown_until = None;
+            }
+        }
+
+        // Detect slot boundary → process accumulated fragments (DON'T clear — persist cross-slot)
+        let now_ms    = chrono::Utc::now().timestamp_millis();
+        let slot_idx  = now_ms / 30_000;
+        if slot_idx != current_slot_idx && current_slot_idx >= 0 {
+            let n = frag_acc.fragment_count();
+            if n > 0 {
+                log::info!("[ACCUM] Slot boundary — processing {} cross-slot fragments", n);
+                for acc in frag_acc.process() {
+                    let _ = event_tx.send(EngineEvent::Accumulated(acc));
+                }
+                // Don't clear — keep accumulating cross-slot
+                // Prune fragments older than 5 minutes
+                frag_acc.prune_older_than(300);
+            }
+        }
+        current_slot_idx = slot_idx;
+
+        // Offload CPU-bound demodulation to blocking thread pool
+        let audio   = ping.audio.clone();
+        let df_hz   = ping.df_hz;
+        let result  = tokio::task::spawn_blocking(move || {
+            longx(&audio, df_hz, params::DEFAULT_DFTOL)
+        }).await.unwrap();
+        let mut parsed = ParsedMessage::parse_geo(&result.raw_decode, Some(&geo));
+        // Remove own callsign — it appears in every TX message so adds no information
+        // and would incorrectly colour-code noise pings that happen to contain it
+        let my_call_upper = settings.my_call.trim().to_uppercase();
+        parsed.valid_callsigns.retain(|c| *c != my_call_upper);
+        parsed.callsigns.retain(|c| *c != my_call_upper);
+        if let Some(ref s) = store { let _ = s.insert_ping(session_id, &ping, &result, &parsed); }
+
+        if result.raw_decode.trim().len() < 2 { continue; }
+
+        // Startup guard — ignore pings for first 3s while audio settles
+        if engine_start.elapsed().as_millis() < STARTUP_MS { continue; }
+
+        // Hard guard: own TX leakage has CCF > 50000 — reject regardless of timing
+        if ping.ccf_ratio > 50_000.0 {
+            log::debug!("[ENGINE] Rejected own-TX leakage ping ccf={:.0}", ping.ccf_ratio);
+            continue;
+        }
+
+        // ── Threshold computation ────────────────────────────────────────────────
+        let in_qso = settings.their_call_hint.is_some();
+        let _has_callsign = !parsed.valid_callsigns.is_empty(); // geo-filtered
+
+        // Our scoring pipeline
+        let threshold_pass = if in_qso {
+            // ── QSO mode: DF-aware relaxed threshold ─────────────────────
+            // Analysis showed real SM2CEW pings cluster at df≈0/+43Hz while
+            // noise bursts are at df=-172/-215/-345/-388/-431Hz.
+            // Within ±86Hz of known station DF: CCF≥90, conf≥0.40
+            // Outside that band: normal threshold (prevents noise flood)
+            // QSO mode: lower CCF floor, but keep conf≥0.50 to separate
+            // real signal (0.49-0.92) from noise (0.40-0.47) at same CCF.
+            // Data shows conf is the reliable discriminator, not DF.
+            ping.ccf_ratio >= 90.0
+                && result.mean_confidence >= 0.50
+        } else {
+            // ── Normal mode: two-arm threshold ────────────────────────────
+            // Arm 1: CCF≥100, conf≥0.45  (main gate, catches bulk of signals)
+            // Arm 2: CCF≥25,  conf≥0.75  (high-confidence short pings —
+            //        brief meteor trails with clean decode but low energy)
+            // Data: 24/26 real signals caught, 0.3:1 FP ratio on G4DCV/I5YDI burst
+            let arm1 = ping.ccf_ratio >= settings.min_ccf
+                && result.mean_confidence >= settings.min_conf;
+            let arm2 = ping.ccf_ratio >= 25.0
+                && result.mean_confidence >= 0.75;
+            arm1 || arm2
+        };
+
+        // ── Accumulator feed — intentionally BEFORE display gate ────────────
+        // Feed any ping with conf≥0.40 regardless of CCF or score.
+        // The accumulator is designed to extract signal from weak pings;
+        // gating it at display threshold defeats its purpose entirely.
+        // Example: M2CEW at CCF=24, conf=0.87 is real data, just a short ping.
+        let accum_gate = result.mean_confidence >= 0.40
+            && result.raw_decode.trim().len() >= 2;
+        if accum_gate {
+            if let Some(frag) = Fragment::from_result(&result, ping.ccf_ratio) {
+                frag_acc.add(frag);
+            }
+        }
+
+        // ── Display gate ──────────────────────────────────────────────────────
+        // RAW mode = MSHV-equivalent: show what WSJT would show
+        // Normal mode = our pipeline
+        // In both cases threshold_pass drives colour coding
+        // Add to analysis ring buffer BEFORE display gate — captures ALL
+        // marginal pings (conf≥0.45) not just ones that pass display threshold
+        if result.mean_confidence >= 0.45 && !result.char_probs.is_empty() {
+            let ap = AnalysisPing {
+                detected_at:     ping.timestamp.to_rfc3339(),
+                df_hz:           ping.df_hz,
+                ccf_ratio:       ping.ccf_ratio,
+                mean_confidence: result.mean_confidence,
+                validity_score:  parsed.validity_score,
+                raw_decode:      result.raw_decode.clone(),
+                char_probs:      result.char_probs.clone(),
+            };
+            analysis_ring.push_back(ap);
+            while analysis_ring.len() > RING_MAX {
+                analysis_ring.pop_front();
+            }
+        }
+
+        let show = threshold_pass;
+        if !show { continue; }
+
+        // Per-character confidence: max of each char's 48-element prob array
+        let char_confs: Vec<f32> = result.char_probs.iter()
+            .map(|probs| probs.iter().cloned().fold(0.0f32, f32::max))
+            .collect();
+
+        let _ = event_tx.send(EngineEvent::Decode(DecodeEntry {
+            timestamp:  ping.timestamp, df_hz: ping.df_hz, ccf_ratio: ping.ccf_ratio,
+            duration_ms: ping.duration_ms,
+            confidence: result.mean_confidence, score: parsed.validity_score,
+            raw: result.raw_decode, callsigns: parsed.valid_callsigns,
+            locator: parsed.locator, report: parsed.report, is_cq: parsed.is_cq,
+            char_confs, is_accumulated: false,
+            my_call: settings.my_call.clone(),
+            df_bin_hz: None,
+            passed_threshold: threshold_pass,
+        }));
+    }
+}
+
+
+// ─── Config persistence (same pattern as MSK2K) ───────────────────────────────
+
+fn config_path() -> PathBuf {
+    let mut p = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    p.push(".fsk441");
+    std::fs::create_dir_all(&p).ok();
+    p.push("fsk441.cfg");
+    p
+}
+
+fn save_config(s: &Settings) {
+    let period = match s.period {
+        Period::TxFirst    => "first",
+        Period::TxSecond   => "second",
+        Period::TxFirst15  => "first15",
+        Period::TxSecond15 => "second15",
+    };
+    let data = format!(
+        "my_call={}\nmy_loc={}\ninput={}\noutput={}\nrig_model={}\nrig_port={}\nrig_baud={}\nhamlib_enabled={}\nperiod={}\ncty_path={}\nmax_km={}\nmin_ccf={}\nmin_conf={}\ntx_level={}\n",
+        s.my_call,
+        s.my_loc,
+        s.sel_in.as_deref().unwrap_or(""),
+        s.sel_out.as_deref().unwrap_or(""),
+        s.rig_model,
+        s.rig_port,
+        s.rig_baud,
+        s.hamlib_enabled,
+        period,
+        s.cty_path,
+        s.max_km,
+        s.min_ccf,
+        s.min_conf,
+        s.tx_level,
+    );
+    if let Err(e) = std::fs::write(config_path(), data) {
+        log::warn!("Failed to save config: {}", e);
+    } else {
+        log::info!("Config saved to {:?}", config_path());
+    }
+}
+
+fn load_config() -> Settings {
+    let mut s = Settings::default();
+    let path  = config_path();
+    let Ok(text) = std::fs::read_to_string(&path) else { return s; };
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once('=') else { continue; };
+        let v = v.trim();
+        match k.trim() {
+            "my_call"        => s.my_call   = v.to_string(),
+            "my_loc"         => s.my_loc    = v.to_string(),
+            "input"          => s.sel_in    = if v.is_empty() { None } else { Some(v.to_string()) },
+            "output"         => s.sel_out   = if v.is_empty() { None } else { Some(v.to_string()) },
+            "rig_model"      => s.rig_model = v.to_string(),
+            "rig_port"       => s.rig_port  = v.to_string(),
+            "rig_baud"       => s.rig_baud  = v.to_string(),
+            "hamlib_enabled" => s.hamlib_enabled = v == "true",
+            "period"         => s.period    = match v {
+                "first"    => Period::TxFirst,
+                "first15"  => Period::TxFirst15,
+                "second15" => Period::TxSecond15,
+                _          => Period::TxSecond,
+            },
+            "cty_path"       => s.cty_path  = v.to_string(),
+            // will re-resolve below if path no longer valid
+            "max_km"         => s.max_km    = v.parse().unwrap_or(3000.0),
+            "min_ccf"        => s.min_ccf   = v.parse().unwrap_or(100.0),
+            "min_conf"       => s.min_conf  = v.parse().unwrap_or(0.45),
+            "tx_level"       => s.tx_level  = v.parse().unwrap_or(0.8),
+            _ => {}
+        }
+    }
+    // Re-resolve cty.dat if saved path no longer valid
+    if !std::path::Path::new(&s.cty_path).exists() {
+        let resolved = default_cty_path();
+        log::warn!("[CFG] cty.dat not found at {:?} — resolved to {:?}", s.cty_path, resolved);
+        s.cty_path = resolved;
+    }
+    log::info!("Config loaded: call={} loc={} in={:?} out={:?}", s.my_call, s.my_loc, s.sel_in, s.sel_out);
+    s
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────────
+
+fn main() -> eframe::Result<()> {
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info")
+    ).init();
+    eframe::run_native("FSK441 PLUS",
+        eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size([1100.0, 700.0])
+                .with_min_inner_size([800.0, 520.0]),
+            ..Default::default()
+        },
+        Box::new(|cc| Ok(Box::new(Fsk441App::new(cc)))))
+}
+
+
+impl Drop for Fsk441App {
+    fn drop(&mut self) {
+        if let Some(ref mut child) = self._rigctld {
+            log::info!("[LAUNCHER] Killing rigctld (pid={})", child.0.id());
+            let _ = child.0.kill();
+        }
+    }
+}

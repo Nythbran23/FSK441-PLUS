@@ -1,0 +1,13 @@
+/target
+*.db
+*.db-wal
+*.db-shm
+*.adi
+*.txt
+Cargo.lock
+.DS_Store
+certificate.p12
+build.keychain
+icon.iconset/
+*.dmg
+*.zip
