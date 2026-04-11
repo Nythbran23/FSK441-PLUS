@@ -20,6 +20,7 @@ mod spectrum;
 mod accumulator;
 mod adif;
 mod analysis;
+mod scatter;
 
 use detector::run_detector;
 use demod::longx;
@@ -205,6 +206,8 @@ struct Settings {
     clear_accumulator: bool,
     their_df_hz:      Option<f32>, // learned DF of QSO partner
     tx_level:       f32,
+    ant_bw_horiz:   f32,   // antenna 3 dB horizontal beamwidth (°)
+    ant_bw_vert:    f32,   // antenna 3 dB vertical beamwidth (°)
 }
 
 impl Default for Settings {
@@ -230,6 +233,8 @@ impl Default for Settings {
             clear_accumulator: false,
             their_df_hz: None,
             tx_level:       0.8,
+            ant_bw_horiz:   40.0,
+            ant_bw_vert:    40.0,
         }
     }
 }
@@ -1106,17 +1111,23 @@ impl eframe::App for Fsk441App {
                 ui.label(egui::RichText::new(now_utc.format("%H:%M:%S").to_string())
                     .monospace().color(egui::Color32::from_gray(200)));
 
-                // IN QSO indicator — shows when Their Call is set and TX has started
-                let in_qso = self.settings.their_call_hint.is_some()
-                    && self.qso_time_on.is_some();
-                if in_qso {
+                // SET state: their_call_hint is Some once SET is pressed.
+                // Callsign shown from SET. ● IN QSO + elapsed only once TX starts.
+                // GC distance, bearing, scatter arc live in the QSO panel row below.
+                let call_set = self.settings.their_call_hint.is_some();
+                let in_qso   = call_set && self.qso_time_on.is_some();
+
+                if call_set {
                     ui.separator();
-                    // IN QSO indicator
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new("● IN QSO")
-                        .monospace().strong()
-                        .color(egui::Color32::from_rgb(255, 180, 0)));
-                    ui.add_space(8.0);
+
+                    // ● IN QSO — only after TX starts
+                    if in_qso {
+                        ui.label(egui::RichText::new("● IN QSO")
+                            .monospace().strong()
+                            .color(egui::Color32::from_rgb(255, 180, 0)));
+                        ui.add_space(8.0);
+                    }
 
                     // Callsign
                     if let Some(ref call) = self.settings.their_call_hint {
@@ -1126,26 +1137,7 @@ impl eframe::App for Fsk441App {
                     }
                     ui.add_space(8.0);
 
-                    // GC distance and bearing if their loc is known
-                    let their_loc = self.their_loc_edit.trim().to_uppercase();
-                    if their_loc.len() >= 4 {
-                        if let (Some(my_qth), Some(their_qth)) = (
-                            geo::Qth::from_maidenhead(&self.settings.my_loc),
-                            geo::Qth::from_maidenhead(&their_loc),
-                        ) {
-                            let dist = great_circle_km(my_qth.lat, my_qth.lon,
-                                                        their_qth.lat, their_qth.lon);
-                            let bearing = great_circle_bearing(my_qth.lat, my_qth.lon,
-                                                               their_qth.lat, their_qth.lon);
-                            ui.label(egui::RichText::new(format!("{:.0}km {:.0}°",
-                                dist, bearing))
-                                .monospace()
-                                .color(egui::Color32::from_rgb(180, 180, 255)));
-                            ui.add_space(8.0);
-                        }
-                    }
-
-                    // QSO start time and elapsed — same size and colour as UTC clock
+                    // QSO start time and elapsed — only after TX starts
                     if let Some(t_on) = self.qso_time_on {
                         let elapsed = now_utc.signed_duration_since(t_on);
                         let mins = elapsed.num_minutes();
@@ -1234,6 +1226,80 @@ impl eframe::App for Fsk441App {
                     ui.add(egui::TextEdit::singleline(&mut self.report_rcvd)
                         .desired_width(40.0).hint_text("26"));
                 });
+
+                // Scatter arc — shown once SET pressed and locator ≥ 4 chars
+                if self.settings.their_call_hint.is_some() {
+                    let their_loc = self.their_loc_edit.trim().to_uppercase();
+                    if their_loc.len() >= 4 {
+                        if let (Some(my_qth), Some(their_qth)) = (
+                            geo::Qth::from_maidenhead(&self.settings.my_loc),
+                            geo::Qth::from_maidenhead(&their_loc),
+                        ) {
+                            let dist    = great_circle_km(my_qth.lat, my_qth.lon,
+                                                          their_qth.lat, their_qth.lon);
+                            let bearing = great_circle_bearing(my_qth.lat, my_qth.lon,
+                                                               their_qth.lat, their_qth.lon);
+                            ui.separator();
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new("Distance")
+                                    .color(egui::Color32::from_gray(220)));
+                                ui.label(egui::RichText::new(format!(
+                                    "{:.0}km {:.0}°", dist, bearing))
+                                    .monospace()
+                                    .color(egui::Color32::from_rgb(180, 180, 255)));
+                            });
+
+                            if let Some(arc) = scatter::compute_scatter_arc(
+                                my_qth.lat, my_qth.lon,
+                                their_qth.lat, their_qth.lon,
+                                self.settings.ant_bw_horiz as f64,
+                            ) {
+                                ui.separator();
+                                ui.vertical(|ui| {
+                                    ui.label(egui::RichText::new("Scatter Arc")
+                                        .color(egui::Color32::from_gray(220)));
+                                    ui.label(egui::RichText::new(format!(
+                                        "{:.0}°–{:.0}°", arc.arc_min, arc.arc_max))
+                                        .monospace()
+                                        .color(egui::Color32::from_rgb(255, 200, 80)));
+                                });
+                                ui.vertical(|ui| {
+                                    ui.label(egui::RichText::new("Beam")
+                                        .color(egui::Color32::from_gray(220)));
+                                    match (arc.beam_left, arc.beam_right) {
+                                        (Some(bl), Some(br)) => {
+                                            ui.label(egui::RichText::new(format!(
+                                                "{:.0}° / {:.0}°", bl, br))
+                                                .monospace()
+                                                .color(egui::Color32::from_rgb(100, 255, 180)));
+                                        }
+                                        (Some(centre), None) => {
+                                            ui.label(egui::RichText::new(format!(
+                                                "{:.0}°", centre))
+                                                .monospace()
+                                                .color(egui::Color32::from_rgb(100, 255, 180)));
+                                        }
+                                        _ => {}
+                                    }
+                                });
+                                ui.vertical(|ui| {
+                                    ui.label(egui::RichText::new("El")
+                                        .color(egui::Color32::from_gray(220)));
+                                    let half_v = self.settings.ant_bw_vert as f64 / 2.0;
+                                    let el_col = if arc.midpoint_el <= half_v {
+                                        egui::Color32::from_gray(160)
+                                    } else {
+                                        egui::Color32::from_rgb(255, 120, 80)
+                                    };
+                                    ui.label(egui::RichText::new(format!(
+                                        "{:.0}°", arc.midpoint_el))
+                                        .monospace()
+                                        .color(el_col));
+                                });
+                            }
+                        }
+                    }
+                }
             });
 
             ui.add_space(5.0);
@@ -2236,6 +2302,20 @@ impl eframe::App for Fsk441App {
                         ui.end_row();
                     });
 
+                    // ── Antenna ───────────────────────────────────────────
+                    ui.separator();
+                    ui.heading("Antenna");
+                    egui::Grid::new("ant").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                        ui.label("H-beamwidth:");
+                        ui.add(egui::Slider::new(&mut self.settings.ant_bw_horiz, 5.0..=120.0)
+                            .suffix("°").fixed_decimals(0));
+                        ui.end_row();
+                        ui.label("V-beamwidth:");
+                        ui.add(egui::Slider::new(&mut self.settings.ant_bw_vert, 5.0..=120.0)
+                            .suffix("°").fixed_decimals(0));
+                        ui.end_row();
+                    });
+
                     ui.separator();
                     if ui.button("Save & Close").clicked() {
                         self.settings_open = false;
@@ -2601,7 +2681,7 @@ fn save_config(s: &Settings) {
         Period::TxSecond15 => "second15",
     };
     let data = format!(
-        "my_call={}\nmy_loc={}\ninput={}\noutput={}\nrig_model={}\nrig_port={}\nrig_baud={}\nhamlib_enabled={}\nperiod={}\ncty_path={}\nmax_km={}\nmin_ccf={}\nmin_conf={}\ntx_level={}\n",
+        "my_call={}\nmy_loc={}\ninput={}\noutput={}\nrig_model={}\nrig_port={}\nrig_baud={}\nhamlib_enabled={}\nperiod={}\ncty_path={}\nmax_km={}\nmin_ccf={}\nmin_conf={}\ntx_level={}\nant_bw_horiz={}\nant_bw_vert={}\n",
         s.my_call,
         s.my_loc,
         s.sel_in.as_deref().unwrap_or(""),
@@ -2616,6 +2696,8 @@ fn save_config(s: &Settings) {
         s.min_ccf,
         s.min_conf,
         s.tx_level,
+        s.ant_bw_horiz,
+        s.ant_bw_vert,
     );
     if let Err(e) = std::fs::write(config_path(), data) {
         log::warn!("Failed to save config: {}", e);
@@ -2652,6 +2734,8 @@ fn load_config() -> Settings {
             "min_ccf"        => s.min_ccf   = v.parse().unwrap_or(100.0),
             "min_conf"       => s.min_conf  = v.parse().unwrap_or(0.45),
             "tx_level"       => s.tx_level  = v.parse().unwrap_or(0.8),
+            "ant_bw_horiz"   => s.ant_bw_horiz = v.parse().unwrap_or(40.0),
+            "ant_bw_vert"    => s.ant_bw_vert   = v.parse().unwrap_or(40.0),
             _ => {}
         }
     }
