@@ -2487,7 +2487,10 @@ fn main() -> eframe::Result<()> {
                 .with_min_inner_size([800.0, 520.0]),
             ..Default::default()
         },
-        Box::new(|cc| Ok(Box::new(Fsk441App::new(cc)))))
+        Box::new(|cc| {
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            Ok(Box::new(Fsk441App::new(cc)))
+        }))
 }
 
 
