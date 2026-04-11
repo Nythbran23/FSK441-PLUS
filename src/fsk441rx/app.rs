@@ -390,6 +390,7 @@ struct Fsk441App {
     qso_summary:     Option<String>,
     rig_freq_hz:     Option<u64>,
     base_freq_hz:    Option<u64>,   // freq at first CAT connect — used for ±250KHz clamp
+    hamlib_false_count: u32,          // hysteresis counter for tx_active deassertion
     freq_edit:       String,         // KHz digits being typed (e.g. "385")
     freq_editing:    bool,           // true when KHz field is active
     cat_connected:   bool,
@@ -501,6 +502,7 @@ impl Fsk441App {
         wf_period_idx: -1,
         tx_msgs: Default::default(), tx_msgs_key: String::new(), qso_log: Vec::new(), seen_calls: Vec::new(), station_tracker: StationTracker::default(), qso_summary: None, settings_watch_tx, rig_freq_hz: None,
             base_freq_hz: None,
+            hamlib_false_count: 0,
             freq_edit: String::new(),
             freq_editing: false, cat_connected: false, last_cat_rx: None, _rigctld: rigctld_guard, settings, _runtime: rt,
         }
@@ -605,10 +607,27 @@ impl Fsk441App {
                     }
                     if upd.transmitting != self.is_transmitting {
                         self.is_transmitting = upd.transmitting;
-                        // Only set tx_active TRUE from hamlib — never set false from here
-                        // tx_active=false is set explicitly in halt_tx() with correct timing
+                        let prev = self.tx_active.load(std::sync::atomic::Ordering::Relaxed);
                         if upd.transmitting {
+                            // PTT asserted — set immediately
+                            if !prev {
+                                log::info!("[TX_ACTIVE] hamlib: false → true at {}",
+                                    chrono::Utc::now().format("%H:%M:%S%.3f"));
+                            }
                             self.tx_active.store(true, std::sync::atomic::Ordering::Relaxed);
+                            self.hamlib_false_count = 0;
+                        } else {
+                            // PTT released — require 3 consecutive false polls before accepting
+                            // This prevents single-poll glitches from leaking TX audio to spectrum
+                            self.hamlib_false_count += 1;
+                            if self.hamlib_false_count >= 3 {
+                                if prev {
+                                    log::info!("[TX_ACTIVE] hamlib: true → false at {} (after {} polls)",
+                                        chrono::Utc::now().format("%H:%M:%S%.3f"),
+                                        self.hamlib_false_count);
+                                }
+                                self.tx_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
                     }
                     continue;
@@ -882,6 +901,7 @@ impl Fsk441App {
         let _ = self.tx_cmd_tx.send(TxCommand::Halt);
         self.is_transmitting = false;
         // Ungate the audio fanout so spectrum and detector resume immediately
+        log::info!("[TX_ACTIVE] halt_tx: setting false at {}", chrono::Utc::now().format("%H:%M:%S%.3f"));
         self.tx_active.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -1043,10 +1063,40 @@ impl eframe::App for Fsk441App {
                     });
                 ui.separator();
 
-                // UTC clock only — countdown is shown in the TX/RX slot indicator above
+                // UTC clock
                 let now_utc = chrono::Utc::now();
                 ui.label(egui::RichText::new(now_utc.format("%H:%M:%S").to_string())
                     .monospace().color(egui::Color32::from_gray(200)));
+
+                // IN QSO indicator — shows when Their Call is set and TX has started
+                let in_qso = self.settings.their_call_hint.is_some()
+                    && self.qso_time_on.is_some();
+                if in_qso {
+                    ui.separator();
+                    // Pulsing amber IN QSO label
+                    ui.label(egui::RichText::new("● IN QSO")
+                        .monospace().strong()
+                        .color(egui::Color32::from_rgb(255, 180, 0)));
+
+                    // With whom
+                    if let Some(ref call) = self.settings.their_call_hint {
+                        ui.label(egui::RichText::new(call)
+                            .monospace().strong()
+                            .color(egui::Color32::from_rgb(100, 220, 100)));
+                    }
+
+                    // QSO start time and duration
+                    if let Some(t_on) = self.qso_time_on {
+                        let started = t_on.format("%H:%MZ").to_string();
+                        let elapsed = now_utc.signed_duration_since(t_on);
+                        let mins = elapsed.num_minutes();
+                        let secs = elapsed.num_seconds() % 60;
+                        ui.label(egui::RichText::new(format!("{}  +{}:{:02}",
+                            started, mins, secs))
+                            .monospace().small()
+                            .color(egui::Color32::from_gray(160)));
+                    }
+                }
 
                 // Settings far right
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1235,9 +1285,10 @@ impl eframe::App for Fsk441App {
                             || matches!(&self.qso, QsoState::Complete { .. }))
                         && !self.qso_logged;
 
-                    // Validate received report — must be a 2-digit number 26-59
+                    // Validate received report — strip R prefix, must be 26-59
                     let rpt_valid = {
-                        let r = self.report_rcvd.trim();
+                        let raw = self.report_rcvd.trim().to_uppercase();
+                        let r = raw.trim_start_matches('R').trim();
                         r.len() == 2 && r.chars().all(|c| c.is_ascii_digit())
                             && r.parse::<u8>().map(|n| n >= 26 && n <= 59).unwrap_or(false)
                     };
@@ -1317,9 +1368,11 @@ impl eframe::App for Fsk441App {
                                 if loc.len() >= 4 { loc } else { format!("{}KM", loc) }
                             };
                             let rst_s    = self.report_sent.trim().to_string();
-                            // Clean received report — reject "73", require 2-digit RST
+                            // Clean received report — strip R prefix, require 2-digit RST 26-59
                             let rst_r = {
-                                let r = self.report_rcvd.trim().to_string();
+                                let r = self.report_rcvd.trim().to_uppercase();
+                                // Strip leading R (e.g. "R28" → "28")
+                                let r = r.trim_start_matches('R').trim().to_string();
                                 let valid = r.len() == 2
                                     && r.chars().all(|c| c.is_ascii_digit())
                                     && r.parse::<u8>().map(|n| n >= 26 && n <= 59).unwrap_or(false);
@@ -1842,7 +1895,11 @@ impl eframe::App for Fsk441App {
                                 }
                             }
                             if let Some(loc) = &e.locator { self.their_loc_edit = loc.clone(); }
-                            if let Some(rpt) = &e.report  { self.report_rcvd = rpt.clone(); }
+                            if let Some(rpt) = &e.report  {
+                                // Strip R prefix (e.g. "R28" → "28")
+                                let clean = rpt.trim_start_matches('R').trim_start_matches('r').to_string();
+                                self.report_rcvd = clean;
+                            }
                         }
 
                         // If multiple callsigns on this row, show small clickable call buttons
@@ -2159,11 +2216,24 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
     let tx_active_fanout = tx_active.clone();
     tokio::spawn(async move {
         let mut rx = audio_rx;
+        let mut was_tx = false;
+        let mut tx_bleed_count = 0u32;
         while let Some(chunk) = rx.recv().await {
-            if !tx_active_fanout.load(std::sync::atomic::Ordering::Relaxed) {
+            let is_tx_now = tx_active_fanout.load(std::sync::atomic::Ordering::Relaxed);
+            // Log unexpected transitions — TX audio reaching fanout when we think we are RX
+            if !is_tx_now {
+                if was_tx {
+                    // Just transitioned TX→RX
+                    log::info!("[FANOUT] TX→RX transition, {} chunks leaked during transition",
+                        tx_bleed_count);
+                    tx_bleed_count = 0;
+                }
                 let _ = audio_spec_tx.send(chunk.clone());
                 let _ = fanout_ping_tx.send(chunk);
+            } else {
+                tx_bleed_count += 1;
             }
+            was_tx = is_tx_now;
         }
     });
 
