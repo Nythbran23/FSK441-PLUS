@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // src/fsk441rx/store.rs
 //
 // SQLite persistence. WAL mode for safe concurrent reads (e.g. from DB Browser
@@ -159,6 +160,18 @@ impl Store {
         Ok(capture_id)
     }
 
+    /// Delete all analysis_pings — call after processing to keep DB lean.
+    /// The ring buffer in RAM is the live store; the DB is only written on demand.
+    pub fn delete_analysis(&self, capture_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM analysis_pings WHERE capture_id = ?1",
+            rusqlite::params![capture_id],
+        )?;
+        log::info!("[DB] Deleted analysis capture_id={}", capture_id);
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     pub fn close_session(&self, session_id: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE sessions SET ended_at = ?1 WHERE id = ?2",
@@ -209,6 +222,7 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    #[allow(dead_code)]
     pub fn session_summary(&self, session_id: i64) -> Result<SessionSummary> {
         let q = |sql: &str| -> i64 {
             self.conn.query_row(sql, params![session_id], |r| r.get(0)).unwrap_or(0)
@@ -225,6 +239,7 @@ impl Store {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct SessionSummary {
     pub total_pings:      i64,
     pub valid_pings:      i64,

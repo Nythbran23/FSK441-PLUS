@@ -202,7 +202,8 @@ struct Settings {
     threshold:      f32,
     min_ccf:        f32,
     min_conf:       f32,
-    clear_accumulator: bool,  // pulse: engine clears frag_acc when true, resets to false
+    clear_accumulator: bool,
+    their_df_hz:      Option<f32>, // learned DF of QSO partner
     tx_level:       f32,
 }
 
@@ -227,6 +228,7 @@ impl Default for Settings {
             min_ccf:        100.0,
             min_conf:       0.45,
             clear_accumulator: false,
+            their_df_hz: None,
             tx_level:       0.8,
         }
     }
@@ -352,6 +354,41 @@ struct DfDot {
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 
+/// Check if a raw decode contains content expected for the current QSO TX state.
+/// Great-circle distance in km (Haversine)
+fn great_circle_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let r = 6371.0f64;
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let a = (dlat/2.0).sin().powi(2)
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon/2.0).sin().powi(2);
+    2.0 * r * a.sqrt().asin()
+}
+
+/// True bearing in degrees
+fn great_circle_bearing(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let dlon = (lon2 - lon1).to_radians();
+    let (lat1r, lat2r) = (lat1.to_radians(), lat2.to_radians());
+    let y = dlon.sin() * lat2r.cos();
+    let x = lat1r.cos() * lat2r.sin() - lat1r.sin() * lat2r.cos() * dlon.cos();
+    (y.atan2(x).to_degrees() + 360.0) % 360.0
+}
+
+
+fn qso_content_match(raw: &str, their_call: &str) -> bool {
+    let upper = raw.to_uppercase();
+    let c = their_call.to_uppercase();
+    let min_len = 4.min(c.len());
+    if c.len() < min_len { return false; }
+    let has_them = (0..=c.len().saturating_sub(min_len))
+        .any(|i| upper.contains(&c[i..i+min_len]));
+    let has_rrr = upper.contains("RRR");
+    let has_73  = upper.contains(" 73 ") || upper.ends_with(" 73")
+                  || upper.starts_with("73 ");
+    has_them || has_rrr || has_73
+}
+
+
 struct Fsk441App {
     settings:        Settings,
     settings_open:   bool,
@@ -390,7 +427,6 @@ struct Fsk441App {
     qso_summary:     Option<String>,
     rig_freq_hz:     Option<u64>,
     base_freq_hz:    Option<u64>,   // freq at first CAT connect — used for ±250KHz clamp
-    hamlib_false_count: u32,          // hysteresis counter for tx_active deassertion
     freq_edit:       String,         // KHz digits being typed (e.g. "385")
     freq_editing:    bool,           // true when KHz field is active
     cat_connected:   bool,
@@ -502,7 +538,6 @@ impl Fsk441App {
         wf_period_idx: -1,
         tx_msgs: Default::default(), tx_msgs_key: String::new(), qso_log: Vec::new(), seen_calls: Vec::new(), station_tracker: StationTracker::default(), qso_summary: None, settings_watch_tx, rig_freq_hz: None,
             base_freq_hz: None,
-            hamlib_false_count: 0,
             freq_edit: String::new(),
             freq_editing: false, cat_connected: false, last_cat_rx: None, _rigctld: rigctld_guard, settings, _runtime: rt,
         }
@@ -560,6 +595,15 @@ impl Fsk441App {
                     ) {
                         self.decodes[pos] = entry.clone();
                     } else {
+                        // Learn their DF from first threshold-passing ping in QSO
+                        if self.settings.their_call_hint.is_some()
+                            && self.settings.their_df_hz.is_none()
+                            && entry.passed_threshold
+                            && entry.confidence >= 0.50 {
+                            self.settings.their_df_hz = Some(entry.df_hz);
+                            log::info!("[QSO] Learned their DF: {:.0}Hz", entry.df_hz);
+                            let _ = self.settings_watch_tx.send(self.settings.clone());
+                        }
                         self.decodes.push(entry.clone());
                         if self.decodes.len() > 500 { self.decodes.remove(0); }
                     }
@@ -576,6 +620,9 @@ impl Fsk441App {
                     continue;
                 }
                 EngineEvent::AnalysisSaved(capture_id, n) => {
+                    // Delete from DB immediately — ring buffer in RAM is the live store
+                    // analysis_pings is only a transit store for the optimiser
+                    // (optimiser reads then we clean up to keep DB lean)
                     self.last_capture_id = Some((capture_id, n));
                     log::info!("[UI] Analysis saved: capture={} n={}", capture_id, n);
                     continue;
@@ -607,27 +654,17 @@ impl Fsk441App {
                     }
                     if upd.transmitting != self.is_transmitting {
                         self.is_transmitting = upd.transmitting;
-                        let prev = self.tx_active.load(std::sync::atomic::Ordering::Relaxed);
-                        if upd.transmitting {
-                            // PTT asserted — set immediately
-                            if !prev {
-                                log::info!("[TX_ACTIVE] hamlib: false → true at {}",
+                        // Only update tx_active from PTT events (freq=None), not freq polls (freq=Some)
+                        // This prevents freq polls (which always send transmitting=false) from
+                        // incorrectly clearing tx_active during transmission
+                        if upd.freq.is_none() {
+                            let prev = self.tx_active.load(std::sync::atomic::Ordering::Relaxed);
+                            if prev != upd.transmitting {
+                                log::info!("[TX_ACTIVE] PTT event: {} → {} at {}",
+                                    prev, upd.transmitting,
                                     chrono::Utc::now().format("%H:%M:%S%.3f"));
                             }
-                            self.tx_active.store(true, std::sync::atomic::Ordering::Relaxed);
-                            self.hamlib_false_count = 0;
-                        } else {
-                            // PTT released — require 3 consecutive false polls before accepting
-                            // This prevents single-poll glitches from leaking TX audio to spectrum
-                            self.hamlib_false_count += 1;
-                            if self.hamlib_false_count >= 3 {
-                                if prev {
-                                    log::info!("[TX_ACTIVE] hamlib: true → false at {} (after {} polls)",
-                                        chrono::Utc::now().format("%H:%M:%S%.3f"),
-                                        self.hamlib_false_count);
-                                }
-                                self.tx_active.store(false, std::sync::atomic::Ordering::Relaxed);
-                            }
+                            self.tx_active.store(upd.transmitting, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                     continue;
@@ -742,9 +779,10 @@ impl Fsk441App {
             message: msg.to_string(),
             output_device: dev,
         });
-        // Set tx_active immediately so detector/spectrum gate fires without UI lag
         self.is_transmitting = true;
-        self.tx_active.store(true, std::sync::atomic::Ordering::Relaxed);
+        // tx_active is controlled solely by hamlib PTT events — do NOT set here
+        // Setting it here causes the spectrum to gate immediately on button press
+        // even when transmitting won't start until the next TX slot
     }
 
 
@@ -1073,28 +1111,52 @@ impl eframe::App for Fsk441App {
                     && self.qso_time_on.is_some();
                 if in_qso {
                     ui.separator();
-                    // Pulsing amber IN QSO label
+                    // IN QSO indicator
+                    ui.add_space(4.0);
                     ui.label(egui::RichText::new("● IN QSO")
                         .monospace().strong()
                         .color(egui::Color32::from_rgb(255, 180, 0)));
+                    ui.add_space(8.0);
 
-                    // With whom
+                    // Callsign
                     if let Some(ref call) = self.settings.their_call_hint {
                         ui.label(egui::RichText::new(call)
                             .monospace().strong()
                             .color(egui::Color32::from_rgb(100, 220, 100)));
                     }
+                    ui.add_space(8.0);
 
-                    // QSO start time and duration
+                    // GC distance and bearing if their loc is known
+                    let their_loc = self.their_loc_edit.trim().to_uppercase();
+                    if their_loc.len() >= 4 {
+                        if let (Some(my_qth), Some(their_qth)) = (
+                            geo::Qth::from_maidenhead(&self.settings.my_loc),
+                            geo::Qth::from_maidenhead(&their_loc),
+                        ) {
+                            let dist = great_circle_km(my_qth.lat, my_qth.lon,
+                                                        their_qth.lat, their_qth.lon);
+                            let bearing = great_circle_bearing(my_qth.lat, my_qth.lon,
+                                                               their_qth.lat, their_qth.lon);
+                            ui.label(egui::RichText::new(format!("{:.0}km {:.0}°",
+                                dist, bearing))
+                                .monospace()
+                                .color(egui::Color32::from_rgb(180, 180, 255)));
+                            ui.add_space(8.0);
+                        }
+                    }
+
+                    // QSO start time and elapsed — same size and colour as UTC clock
                     if let Some(t_on) = self.qso_time_on {
-                        let started = t_on.format("%H:%MZ").to_string();
                         let elapsed = now_utc.signed_duration_since(t_on);
                         let mins = elapsed.num_minutes();
                         let secs = elapsed.num_seconds() % 60;
-                        ui.label(egui::RichText::new(format!("{}  +{}:{:02}",
-                            started, mins, secs))
-                            .monospace().small()
-                            .color(egui::Color32::from_gray(160)));
+                        ui.label(egui::RichText::new(t_on.format("%H:%MZ").to_string())
+                            .monospace()
+                            .color(egui::Color32::from_gray(200)));
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(format!("+{}:{:02}", mins, secs))
+                            .monospace()
+                            .color(egui::Color32::from_gray(200)));
                     }
                 }
 
@@ -1136,8 +1198,6 @@ impl eframe::App for Fsk441App {
                         .interactive(!field_locked));
                     if edit_resp.changed() {
                         self.tx_msgs_key.clear();
-                        // Don't activate QSO mode on typing — wait for Set button
-                        // But clear hint if field emptied
                         if self.their_call_edit.is_empty() {
                             self.settings.their_call_hint = None;
                             let _ = self.settings_watch_tx.send(self.settings.clone());
@@ -1145,7 +1205,7 @@ impl eframe::App for Fsk441App {
                     }
                     if field_locked {
                         // Show lock + click to unlock
-                        if ui.label(egui::RichText::new("🔒")
+                        if ui.label(egui::RichText::new("[locked]")
                             .small().color(egui::Color32::YELLOW))
                             .on_hover_text("Click ⟳ Clear to unlock")
                             .clicked() {}
@@ -1222,9 +1282,17 @@ impl eframe::App for Fsk441App {
                         } else {
                             log::info!("[APP] {} clicked: {}", labels[i], msg);
                             self.qso_log.push(format!("{}: {}", labels[i], msg));
-                            if (i == 1 || i == 2) && self.qso_time_on.is_none() {
-                                self.qso_time_on = Some(chrono::Utc::now());
-                                self.qso_logged = false;
+                            if i == 1 || i == 2 {
+                                // Auto-set their_call_hint from field if not already set
+                                // Handles the case where TX is pressed without Set
+                                let tc = self.their_call_edit.trim().to_uppercase();
+                                if !tc.is_empty() && self.settings.their_call_hint.is_none() {
+                                    self.settings.their_call_hint = Some(tc);
+                                }
+                                if self.qso_time_on.is_none() {
+                                    self.qso_time_on = Some(chrono::Utc::now());
+                                    self.qso_logged = false;
+                                }
                             }
                             self.active_tx_idx = Some(i);
                             self.send_tx(&msg);
@@ -1267,9 +1335,11 @@ impl eframe::App for Fsk441App {
                         self.halt_tx();
                         self.qso = QsoState::Idle;
                         self.settings.their_call_hint = None;
+                        self.settings.their_df_hz = None;
                         let _ = self.settings_watch_tx.send(self.settings.clone());
                         self.qso_time_on = None;
                         self.qso_logged = false;
+                        self.active_tx_idx = None;
                         // Clear decode list and accumulator
                         self.clear_decodes();
                         self.settings.clear_accumulator = true;
@@ -1811,15 +1881,37 @@ impl eframe::App for Fsk441App {
                                 .monospace()
                                 .color(egui::Color32::from_gray(110)));
 
-                            // Render each character coloured by its confidence
+                            // Render only the meaningful portion of the decode:
+                            // trim leading/trailing characters below conf_thresh_show.
+                            // This strips the surrounding noise and shows only where
+                            // the decoder found real signal — much cleaner on weak pings.
                             let chars: Vec<char> = e.raw.trim().chars().collect();
                             let confs = &e.char_confs;
                             let conf_thresh_bold = 0.5f32;
                             let conf_thresh_show = 0.15f32;
 
-
+                            // Find the meaningful span using a higher trim threshold (0.35)
+                            // Characters below this are indistinguishable from noise
+                            let conf_trim = 0.35f32;
+                            let first = chars.iter().enumerate()
+                                .find(|(ci, _)| confs.get(*ci).copied().unwrap_or(0.0) >= conf_trim)
+                                .map(|(ci, _)| ci)
+                                .unwrap_or(0);
+                            let last = chars.iter().enumerate().rev()
+                                .find(|(ci, _)| confs.get(*ci).copied().unwrap_or(0.0) >= conf_trim)
+                                .map(|(ci, _)| ci)
+                                .unwrap_or(chars.len().saturating_sub(1));
+                            // If trimmed significantly, show ellipsis indicator
+                            let trimmed_front = first > 2;
+                            let trimmed_back  = last + 3 < chars.len();
+                            if trimmed_front {
+                                ui.label(egui::RichText::new("…").monospace()
+                                    .color(egui::Color32::from_gray(50)));
+                            }
 
                             for (ci, ch) in chars.iter().enumerate() {
+                                // Skip chars outside the meaningful span
+                                if ci < first || ci > last { continue; }
                                 let conf = confs.get(ci).copied().unwrap_or(0.0);
                                 let (r, g, b, bold) = if e.is_accumulated {
                                     if conf >= conf_thresh_bold { (255u8, 200u8,  50u8, true) }
@@ -1838,6 +1930,11 @@ impl eframe::App for Fsk441App {
                                     .color(egui::Color32::from_rgb(r, g, b));
                                 let rt = if bold { rt.strong() } else { rt };
                                 ui.label(rt);
+                            }
+
+                            if trimmed_back {
+                                ui.label(egui::RichText::new("…").monospace()
+                                    .color(egui::Color32::from_gray(50)));
                             }
 
                             // 📋 Copy button — small, at end of row
@@ -2217,23 +2314,22 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
     tokio::spawn(async move {
         let mut rx = audio_rx;
         let mut was_tx = false;
-        let mut tx_bleed_count = 0u32;
         while let Some(chunk) = rx.recv().await {
             let is_tx_now = tx_active_fanout.load(std::sync::atomic::Ordering::Relaxed);
-            // Log unexpected transitions — TX audio reaching fanout when we think we are RX
-            if !is_tx_now {
-                if was_tx {
-                    // Just transitioned TX→RX
-                    log::info!("[FANOUT] TX→RX transition, {} chunks leaked during transition",
-                        tx_bleed_count);
-                    tx_bleed_count = 0;
-                }
-                let _ = audio_spec_tx.send(chunk.clone());
-                let _ = fanout_ping_tx.send(chunk);
-            } else {
-                tx_bleed_count += 1;
+            if was_tx && !is_tx_now {
+                // TX→RX transition: drain all queued TX audio from channel before resuming
+                // These are TX audio chunks that backed up in the buffer during transmission
+                let mut drained = 0u32;
+                while rx.try_recv().is_ok() { drained += 1; }
+                log::info!("[FANOUT] TX→RX: drained {} queued TX chunks", drained);
+                was_tx = false;
+                continue;
             }
             was_tx = is_tx_now;
+            if !is_tx_now {
+                let _ = audio_spec_tx.send(chunk.clone());
+                let _ = fanout_ping_tx.send(chunk);
+            }
         }
     });
 
@@ -2267,8 +2363,13 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
                 let entries: Vec<AnalysisPing> = analysis_ring.iter().cloned().collect();
                 let n = entries.len();
                 match s.save_analysis(&entries) {
-                    Ok(cid) => { let _ = event_tx.send(EngineEvent::AnalysisSaved(cid, n)); }
-                    Err(e)  => log::error!("[DB] save_analysis failed: {}", e),
+                    Ok(cid) => {
+                        let _ = event_tx.send(EngineEvent::AnalysisSaved(cid, n));
+                        // Immediately delete — data was written for the optimiser which
+                        // reads synchronously in save_analysis; DB doesn't need to keep it
+                        let _ = s.delete_analysis(cid);
+                    }
+                    Err(e) => log::error!("[DB] save_analysis failed: {}", e),
                 }
             } else {
                 log::warn!("[DB] Cannot save analysis — no DB connection");
@@ -2390,16 +2491,8 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
 
         // Our scoring pipeline
         let threshold_pass = if in_qso {
-            // ── QSO mode: DF-aware relaxed threshold ─────────────────────
-            // Analysis showed real SM2CEW pings cluster at df≈0/+43Hz while
-            // noise bursts are at df=-172/-215/-345/-388/-431Hz.
-            // Within ±86Hz of known station DF: CCF≥90, conf≥0.40
-            // Outside that band: normal threshold (prevents noise flood)
-            // QSO mode: lower CCF floor, but keep conf≥0.50 to separate
-            // real signal (0.49-0.92) from noise (0.40-0.47) at same CCF.
-            // Data shows conf is the reliable discriminator, not DF.
-            ping.ccf_ratio >= 90.0
-                && result.mean_confidence >= 0.50
+            (ping.ccf_ratio >= settings.min_ccf && result.mean_confidence >= settings.min_conf)
+                || result.mean_confidence >= 0.70
         } else {
             // ── Normal mode: two-arm threshold ────────────────────────────
             // Arm 1: CCF≥100, conf≥0.45  (main gate, catches bulk of signals)
@@ -2409,7 +2502,7 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
             let arm1 = ping.ccf_ratio >= settings.min_ccf
                 && result.mean_confidence >= settings.min_conf;
             let arm2 = ping.ccf_ratio >= 25.0
-                && result.mean_confidence >= 0.75;
+                && result.mean_confidence >= 0.70;
             arm1 || arm2
         };
 
@@ -2425,6 +2518,26 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
                 frag_acc.add(frag);
             }
         }
+
+        // Learn their DF from threshold-passing pings during QSO
+        if in_qso && threshold_pass && settings.their_df_hz.is_none() {
+            // First good ping in QSO — record their DF
+            // Send back via a side-channel: update settings and broadcast
+            // (We can't mutate settings directly here, but we can note it for
+            //  the next settings update. Use a workaround: store in a local.)
+        }
+
+        // QSO content override — callsign matching is specific enough without DF gate
+        // Different meteor trails give different Doppler — don't restrict by DF
+        let content_override = in_qso
+            && result.mean_confidence >= 0.45
+            && {
+                if let Some(ref their) = settings.their_call_hint {
+                    qso_content_match(&result.raw_decode, their)
+                } else { false }
+            };
+
+        let show = threshold_pass || content_override;
 
         // ── Display gate ──────────────────────────────────────────────────────
         // RAW mode = MSHV-equivalent: show what WSJT would show
@@ -2448,7 +2561,6 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
             }
         }
 
-        let show = threshold_pass;
         if !show { continue; }
 
         // Per-character confidence: max of each char's 48-element prob array
