@@ -21,7 +21,7 @@ jobs:
             target: aarch64-apple-darwin
             artifact: fsk441-macos-arm64
             bundle: true
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             artifact: fsk441-macos-x64
             bundle: true
@@ -57,7 +57,8 @@ jobs:
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \
             libxkbcommon-dev \
-            libglib2.0-dev
+            libglib2.0-dev \
+            libudev-dev
 
       - name: Cache cargo
         uses: actions/cache@v4
