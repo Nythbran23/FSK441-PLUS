@@ -130,7 +130,7 @@ fn enumerate_rigs() -> Vec<(String, String)> {
 
 fn enumerate_serial_ports() -> Vec<String> {
     match serialport::available_ports() {
-        Ok(ports) => ports.iter().map(|p| p.port_name.clone()).collect(),
+        Ok(ports) => ports.iter().map(|p: &serialport::SerialPortInfo| p.port_name.clone()).collect::<Vec<_>>(),
         Err(_)    => vec![],
     }
 }
@@ -605,7 +605,11 @@ impl Fsk441App {
                     }
                     if upd.transmitting != self.is_transmitting {
                         self.is_transmitting = upd.transmitting;
-                        self.tx_active.store(upd.transmitting, std::sync::atomic::Ordering::Relaxed);
+                        // Only set tx_active TRUE from hamlib — never set false from here
+                        // tx_active=false is set explicitly in halt_tx() with correct timing
+                        if upd.transmitting {
+                            self.tx_active.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                     continue;
                 }
@@ -1216,6 +1220,11 @@ impl eframe::App for Fsk441App {
                         let _ = self.settings_watch_tx.send(self.settings.clone());
                         self.qso_time_on = None;
                         self.qso_logged = false;
+                        // Clear decode list and accumulator
+                        self.clear_decodes();
+                        self.settings.clear_accumulator = true;
+                        let _ = self.settings_watch_tx.send(self.settings.clone());
+                        self.settings.clear_accumulator = false;
                         self.qso_log.push("--- Cleared ---".to_string());
                     }
                     // LOG QSO button — state machine:
@@ -2488,6 +2497,7 @@ fn main() -> eframe::Result<()> {
             ..Default::default()
         },
         Box::new(|cc| {
+            // Force dark theme regardless of OS setting
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             Ok(Box::new(Fsk441App::new(cc)))
         }))
