@@ -11,6 +11,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -219,10 +222,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Upload to release
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' && runner.os == 'Windows'
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            ${{ matrix.artifact }}.dmg
-            ${{ matrix.artifact }}.tar.gz
-            ${{ matrix.artifact }}.zip
+          files: ${{ matrix.artifact }}.zip
