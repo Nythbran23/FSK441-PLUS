@@ -236,9 +236,33 @@ impl Store {
             unique_locators:   q("SELECT COUNT(DISTINCT locator) FROM pings WHERE session_id=?1 AND locator IS NOT NULL"),
         })
     }
-}
 
-#[derive(Debug)]
+    /// Clear threshold_history and analysis_pings so the optimiser recalibrates
+    /// from scratch on next run. Keeps pings table intact.
+    pub fn reset_for_recalibration(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "DELETE FROM threshold_history; DELETE FROM analysis_pings;"
+        )?;
+        log::info!("[DB] Reset threshold_history and analysis_pings for recalibration");
+        Ok(())
+    }
+
+    /// Count total pings in DB — used to trigger early auto-calibration
+    pub fn count_pings(&self) -> i64 {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM pings", [],
+            |r| r.get(0)
+        ).unwrap_or(0)
+    }
+
+    /// True if threshold_history is empty — indicates a fresh/reset DB
+    pub fn needs_calibration(&self) -> bool {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM threshold_history", [],
+            |r| r.get::<_, i64>(0)
+        ).unwrap_or(0) == 0
+    }
+}#[derive(Debug)]
 #[allow(dead_code)]
 pub struct SessionSummary {
     pub total_pings:      i64,

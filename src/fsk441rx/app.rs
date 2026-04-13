@@ -497,6 +497,7 @@ struct Fsk441App {
     _runtime:        tokio::runtime::Runtime,
     _rigctld:        Option<ProcessGuard>,
     settings_watch_tx: tokio::sync::watch::Sender<Settings>,
+    recalibrate_tx:    mpsc::UnboundedSender<()>,   // triggers immediate optimiser run
     qso_time_on:       Option<chrono::DateTime<chrono::Utc>>,
     qso_logged:        bool,
     adif_logger:       AdifLogger,
@@ -524,6 +525,7 @@ impl Fsk441App {
 
         let s = settings.clone();
         let (settings_watch_tx, settings_watch_rx) = tokio::sync::watch::channel(s.clone());
+        let (recalibrate_tx, recalibrate_rx) = mpsc::unbounded_channel::<()>();
 
         let tx_engine = tx::TxEngine::new(
             tx_cmd_rx, settings.period,
@@ -546,7 +548,7 @@ impl Fsk441App {
         let tx_active_for_engine = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let tx_active_for_app    = tx_active_for_engine.clone();
         let et = event_tx.clone();
-        rt.spawn(async move { run_engine(s, et, tx_active_for_engine, settings_watch_rx).await; });
+        rt.spawn(async move { run_engine(s, et, tx_active_for_engine, settings_watch_rx, recalibrate_rx).await; });
 
         // Auto-launch rigctld if hamlib enabled and rig configured — same as MSK2K
         let mut rigctld_guard: Option<ProcessGuard> = None;
@@ -624,10 +626,36 @@ impl Fsk441App {
         qso_logged: false,
         adif_logger: AdifLogger::new(&AdifLogger::default_path()),
         adif_log: Vec::new(),
-        last_analysis: None,
+        // Check DB at startup — if threshold_history exists, hide Reset & Recalibrate button
+        // by using Some(placeholder). Real result arrives after first optimiser run.
+        last_analysis: {
+            let db_path = {
+                let mut p = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+                p.push(".fsk441"); p.push("fsk441.db");
+                p
+            };
+            if let Ok(store) = crate::store::Store::open(&db_path) {
+                if !store.needs_calibration() {
+                    // Mature DB — suppress button until first real optimiser result
+                    Some(Box::new(ThresholdSuggestion {
+                        analysed_at: String::new(), window_hours: 0.0,
+                        n_noise_pings: 0, n_signal_pings: 0, n_confirmed_qsos: 0,
+                        noise_ccf_p95: 0.0, noise_ccf_p99: 0.0,
+                        noise_conf_p95: 0.0, noise_conf_p99: 0.0,
+                        current_arm1_ccf: settings.min_ccf, current_arm1_conf: settings.min_conf,
+                        current_arm2_ccf: settings.arm2_ccf, current_arm2_conf: settings.arm2_conf,
+                        current_recall: 0.0, current_precision: 0.0, current_f1: 0.0,
+                        suggested_arm1_ccf: settings.min_ccf, suggested_arm1_conf: settings.min_conf,
+                        suggested_arm2_ccf: settings.arm2_ccf, suggested_arm2_conf: settings.arm2_conf,
+                        suggested_recall: 0.0, suggested_precision: 0.0, suggested_f1: 0.0,
+                        summary: String::new(), auto_apply: false,
+                    }))
+                } else { None }
+            } else { None }
+        },
         wf_amplitude: Vec::new(),
         wf_period_idx: -1,
-        tx_msgs: Default::default(), tx_msgs_key: String::new(), qso_log: Vec::new(), seen_calls: Vec::new(), station_tracker: StationTracker::default(), qso_summary: None, settings_watch_tx, rig_freq_hz: None,
+        tx_msgs: Default::default(), tx_msgs_key: String::new(), qso_log: Vec::new(), seen_calls: Vec::new(), station_tracker: StationTracker::default(), qso_summary: None, settings_watch_tx, recalibrate_tx, rig_freq_hz: None,
             base_freq_hz: None,
             freq_edit: String::new(),
             freq_editing: false, cat_connected: false, last_cat_rx: None, _rigctld: rigctld_guard, settings, _runtime: rt,
@@ -771,6 +799,17 @@ impl Fsk441App {
                     continue;
                 }
                 EngineEvent::ThresholdAnalysis(suggestion) => {
+                    if suggestion.auto_apply {
+                        // Auto-apply on recalibration or first-run calibration
+                        self.settings.min_ccf   = suggestion.suggested_arm1_ccf;
+                        self.settings.min_conf  = suggestion.suggested_arm1_conf;
+                        self.settings.arm2_ccf  = suggestion.suggested_arm2_ccf;
+                        self.settings.arm2_conf = suggestion.suggested_arm2_conf;
+                        save_config(&self.settings);
+                        let _ = self.settings_watch_tx.send(self.settings.clone());
+                        log::info!("[ANALYSIS] Auto-applied thresholds: CCF≥{:.0} conf≥{:.2}",
+                            suggestion.suggested_arm1_ccf, suggestion.suggested_arm1_conf);
+                    }
                     self.last_analysis = Some(suggestion);
                     continue;
                 }
@@ -2527,7 +2566,11 @@ impl eframe::App for Fsk441App {
                         // Optimiser suggestion
                         ui.label("");
                         if let Some(ref s) = self.last_analysis {
-                            if s.is_improvement() {
+                            if s.current_f1 == 0.0 {
+                                // Placeholder — real result pending first optimiser run
+                                ui.label(egui::RichText::new("Optimiser: runs every 30min — thresholds loaded from history")
+                                    .color(egui::Color32::from_gray(170)));
+                            } else if s.is_improvement() {
                                 ui.vertical(|ui| {
                                     ui.label(egui::RichText::new(format!(
                                         "Optimiser suggests  Arm1: CCF≥{:.0} conf≥{:.2}  Arm2: CCF≥{:.0} conf≥{:.2}  F1 {:.3}→{:.3}",
@@ -2570,6 +2613,40 @@ impl eframe::App for Fsk441App {
                         ui.end_row();
                     });
 
+                    // Reset & Recalibrate — only shown when no threshold history exists
+                    // (new DB, or after a manual reset). Disappears once optimiser has run.
+                    if self.last_analysis.is_none() {
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.add(egui::Button::new(
+                                egui::RichText::new("🔄 Reset & Recalibrate")
+                                    .color(egui::Color32::from_rgb(220, 160, 60))))
+                                .on_hover_text("Clear threshold history and re-train the noise filter from scratch.\nUse this if you are getting too much garbage or missing real signals.\nThresholds will be auto-applied after ~30 decodes.")
+                                .clicked()
+                            {
+                                let db_path = {
+                                    let mut p = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+                                    p.push(".fsk441"); p.push("fsk441.db");
+                                    p
+                                };
+                                if let Ok(store) = crate::store::Store::open(&db_path) {
+                                    match store.reset_for_recalibration() {
+                                        Ok(_) => {
+                                            log::info!("[ANALYSIS] Reset complete — recalibration will fire after 30 decodes");
+                                            let _ = self.recalibrate_tx.send(());
+                                            // Clear last_analysis so button stays visible until re-trained
+                                            self.last_analysis = None;
+                                        }
+                                        Err(e) => log::error!("[ANALYSIS] Reset failed: {}", e),
+                                    }
+                                }
+                            }
+                            ui.label(egui::RichText::new("Clears noise training — auto-retrains from current band conditions")
+                                .color(egui::Color32::from_gray(150))
+                                .italics());
+                        });
+                    }
+
                     ui.separator();
                     if ui.button("Save & Close").clicked() {
                         self.settings_open = false;
@@ -2589,7 +2666,7 @@ impl eframe::App for Fsk441App {
 
 // ─── Engine ───────────────────────────────────────────────────────────────────
 
-async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEvent>, tx_active: std::sync::Arc<std::sync::atomic::AtomicBool>, mut settings_rx: tokio::sync::watch::Receiver<Settings>) {
+async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEvent>, tx_active: std::sync::Arc<std::sync::atomic::AtomicBool>, mut settings_rx: tokio::sync::watch::Receiver<Settings>, mut recalibrate_rx: mpsc::UnboundedReceiver<()>) {
     let mut settings = settings; // mutable local copy
 
     let qth = Qth::from_maidenhead(&settings.my_loc).unwrap_or_default();
@@ -2690,6 +2767,11 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
     let mut last_optimiser_run = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(25 * 60))  // run ~5min after start
         .unwrap_or(std::time::Instant::now());
+    // Early auto-calibration: fire once when we have enough pings on a fresh DB
+    let needs_early_calibration = store.as_ref()
+        .map(|s| s.needs_calibration())
+        .unwrap_or(false);
+    let mut early_calibration_done = !needs_early_calibration;
     let optimiser_db_path = {
         let mut p = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
         p.push(".fsk441"); p.push("fsk441.db");
@@ -2701,21 +2783,47 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
     let mut tx_cooldown_until: Option<std::time::Instant> = None;
     let mut was_transmitting = false;
 
-    while let Some(ping) = ping_rx.recv().await {
+    loop {
+        let ping_opt = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            ping_rx.recv()
+        ).await;
+
+        if let Ok(None) = ping_opt { break; }
+
         let is_tx = tx_active.load(std::sync::atomic::Ordering::Relaxed);
 
-        // Background threshold optimiser — every 30 minutes
-        if last_optimiser_run.elapsed() >= std::time::Duration::from_secs(30 * 60) {
+        // Background threshold optimiser — every 30 minutes, or triggered by recalibrate
+        let force_calibrate = recalibrate_rx.try_recv().is_ok();
+
+        // Early auto-calibration: fire once on fresh/reset DB after 30+ pings
+        let do_early = if !early_calibration_done {
+            store.as_ref().map(|s| s.count_pings() >= 30).unwrap_or(false)
+        } else { false };
+
+        if force_calibrate || do_early
+            || last_optimiser_run.elapsed() >= std::time::Duration::from_secs(30 * 60)
+        {
+            if do_early {
+                log::info!("[ANALYSIS] Early auto-calibration triggered after 30+ pings");
+                early_calibration_done = true;
+            }
+            if force_calibrate {
+                log::info!("[ANALYSIS] Recalibration triggered by user");
+            }
             last_optimiser_run = std::time::Instant::now();
             let db = optimiser_db_path.clone();
             let et = event_tx.clone();
+            let auto_apply = force_calibrate || do_early;
             let (a1c, a1f, a2c, a2f) = (
                 settings.min_ccf, settings.min_conf, settings.arm2_ccf, settings.arm2_conf,
             );
-            // Spawn blocking task so it doesn't block the audio loop
             tokio::task::spawn_blocking(move || {
                 match analysis::run_optimiser(&db, 24.0, a1c, a1f, a2c, a2f) {
-                    Ok(s)  => { let _ = et.send(EngineEvent::ThresholdAnalysis(Box::new(s))); }
+                    Ok(mut s) => {
+                        s.auto_apply = auto_apply;
+                        let _ = et.send(EngineEvent::ThresholdAnalysis(Box::new(s)));
+                    }
                     Err(e) => { log::debug!("[ANALYSIS] Skipped: {}", e); }
                 }
             });
@@ -2780,6 +2888,12 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
             continue;
         }
         was_transmitting = false;
+
+        // If this iteration was a timeout (no ping), nothing more to do
+        let ping = match ping_opt {
+            Ok(Some(p)) => p,
+            _ => continue,
+        };
 
         // Reject pings during cooldown after TX (loopback tail)
         if let Some(until) = tx_cooldown_until {

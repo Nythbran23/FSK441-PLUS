@@ -47,6 +47,8 @@ pub struct ThresholdSuggestion {
     pub suggested_precision: f32,
     pub suggested_f1:        f32,
     pub summary:             String,
+    /// If true, UI should auto-apply without user confirmation
+    pub auto_apply:          bool,
 }
 
 impl ThresholdSuggestion {
@@ -163,22 +165,15 @@ pub fn run_optimiser(
         current_arm2_ccf, current_arm2_conf,
     );
 
-    // Grid search
-    // arm1 conf floor: must be at least noise_conf_p99 + 0.08 margin.
-    // This prevents the optimiser recommending a conf threshold that sits
-    // inside the measured noise distribution. With p99≈0.477, the floor is
-    // ~0.557, so the minimum arm1 conf the grid can ever suggest is 0.58.
-    let arm1_conf_floor = (noise_conf_p99 + 0.08).max(0.50);
-
+    // Grid search — MSHV floor: conf≥0.43, CCF≥25
     let mut best_f1 = 0.0f32;
     let mut best = (current_arm1_ccf, current_arm1_conf,
                     current_arm2_ccf, current_arm2_conf);
 
     for &a1c in &[50.0f32, 75.0, 100.0, 125.0, 150.0, 200.0] {
-        for &a1f in &[0.50f32, 0.52, 0.54, 0.55, 0.56, 0.58, 0.60, 0.62, 0.65] {
-            if a1f < arm1_conf_floor { continue; }  // below noise floor — skip
-            for &a2c in &[15.0f32, 20.0, 25.0, 30.0, 40.0, 50.0] {
-                for &a2f in &[0.65f32, 0.70, 0.72, 0.75, 0.78, 0.80, 0.85] {
+        for &a1f in &[0.43f32, 0.44, 0.45, 0.46, 0.47, 0.48, 0.50] {
+            for &a2c in &[15.0f32, 20.0, 25.0, 30.0, 40.0] {
+                for &a2f in &[0.65f32, 0.70, 0.72, 0.75, 0.78, 0.80] {
                     if a1c < 25.0 || a1f < 0.43 { continue; }
                     if a2c < 15.0 || a2f < 0.65 { continue; }
                     let (_, _, f1) = score(a1c, a1f, a2c, a2f);
@@ -192,11 +187,11 @@ pub fn run_optimiser(
 
     let summary = format!(
         "{:.0}h window: {} signal / {} noise (balanced from {})\n\
-         Noise conf: 95th={:.3} 99th={:.3}  arm1 floor={:.3}\n\
+         Noise conf: 95th={:.3} 99th={:.3}\n\
          Current  (CCF≥{:.0}+conf≥{:.2} | CCF≥{:.0}+conf≥{:.2}): F1={:.3} P={:.2} R={:.2}\n\
          Suggested(CCF≥{:.0}+conf≥{:.2} | CCF≥{:.0}+conf≥{:.2}): F1={:.3} P={:.2} R={:.2}{}",
         window_hours, n_signal, n_noise, n_noise_total,
-        noise_conf_p95, noise_conf_p99, arm1_conf_floor,
+        noise_conf_p95, noise_conf_p99,
         current_arm1_ccf, current_arm1_conf, current_arm2_ccf, current_arm2_conf,
         cur_f1, cur_prec, cur_rec,
         best.0, best.1, best.2, best.3,
@@ -237,6 +232,7 @@ pub fn run_optimiser(
         suggested_arm2_ccf: best.2, suggested_arm2_conf: best.3,
         suggested_recall: sug_rec, suggested_precision: sug_prec, suggested_f1: sug_f1,
         summary,
+        auto_apply: false,
     })
 }
 
