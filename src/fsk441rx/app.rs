@@ -21,6 +21,7 @@ mod accumulator;
 mod adif;
 mod analysis;
 mod scatter;
+mod second_pass;
 
 use detector::run_detector;
 use demod::longx;
@@ -157,9 +158,12 @@ pub struct DecodeEntry {
     my_call:        String,
     df_bin_hz:      Option<i32>,
     passed_threshold: bool,  // false = shown only in RAW mode  // set for accumulated rows — used to update in place
+    is_second_pass:   bool,  // true = second-pass recovery, rendered italic cyan
+    /// For second-pass rows: (char, energy, confirmed_above_floor)
+    second_pass_chars: Vec<(char, bool)>,
 }
 
-enum EngineEvent { Decode(DecodeEntry), Accumulated(AccumulatedDecode), Hamlib(HamlibUpdate), Spectrum(Vec<f32>, f32), AnalysisSaved(i64, usize), ThresholdAnalysis(Box<ThresholdSuggestion>) }
+enum EngineEvent { Decode(DecodeEntry), Accumulated(AccumulatedDecode), Hamlib(HamlibUpdate), Spectrum(Vec<f32>, f32), AnalysisSaved(i64, usize), ThresholdAnalysis(Box<ThresholdSuggestion>), SecondPassDecodes(Vec<second_pass::SecondPassResult>) }
 
 
 /// Find cty.dat — checks next to binary first, then ~/MSK2Ksoft, then current dir.
@@ -208,6 +212,9 @@ struct Settings {
     tx_level:       f32,
     ant_bw_horiz:   f32,   // antenna 3 dB horizontal beamwidth (°)
     ant_bw_vert:    f32,   // antenna 3 dB vertical beamwidth (°)
+    arm2_ccf:       f32,   // Arm 2 min CCF (weak high-conf pings)
+    arm2_conf:      f32,   // Arm 2 min confidence
+    save_max_data:  bool,  // retain analysis_pings in DB for off-line analysis
 }
 
 impl Default for Settings {
@@ -235,6 +242,9 @@ impl Default for Settings {
             tx_level:       0.8,
             ant_bw_horiz:   40.0,
             ant_bw_vert:    40.0,
+            arm2_ccf:       40.0,
+            arm2_conf:      0.80,
+            save_max_data:  false,
         }
     }
 }
@@ -439,13 +449,14 @@ struct Fsk441App {
     _runtime:        tokio::runtime::Runtime,
     _rigctld:        Option<ProcessGuard>,
     settings_watch_tx: tokio::sync::watch::Sender<Settings>,
-    analysis_save_tx:  mpsc::UnboundedSender<()>,
-    last_capture_id:   Option<(i64, usize)>,
     qso_time_on:       Option<chrono::DateTime<chrono::Utc>>,
     qso_logged:        bool,   // true after successful ADIF write — hides LOG button
     adif_logger:       AdifLogger,
     adif_log:          Vec<QsoRecord>,
     last_analysis:     Option<Box<ThresholdSuggestion>>,  // latest optimiser result
+    // Second-pass decoder
+    event_tx:            mpsc::UnboundedSender<EngineEvent>,  // kept for spawning second-pass
+    second_pass_db_path: String,
 }
 
 impl Fsk441App {
@@ -459,12 +470,12 @@ impl Fsk441App {
             .enable_all().build().expect("Tokio runtime");
 
         let (event_tx, event_rx) = mpsc::unbounded_channel::<EngineEvent>();
+        let event_tx_ui = event_tx.clone();  // kept in App struct for second-pass spawning
         let (tx_cmd_tx, tx_cmd_rx) = mpsc::unbounded_channel::<TxCommand>();
         let (hamlib_tx, hamlib_rx)   = mpsc::unbounded_channel::<HamlibUpdate>();
 
         let s = settings.clone();
         let (settings_watch_tx, settings_watch_rx) = tokio::sync::watch::channel(s.clone());
-        let (analysis_save_tx, analysis_save_rx) = mpsc::unbounded_channel::<()>();
 
         let tx_engine = tx::TxEngine::new(
             tx_cmd_rx, settings.period,
@@ -487,7 +498,7 @@ impl Fsk441App {
         let tx_active_for_engine = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let tx_active_for_app    = tx_active_for_engine.clone();
         let et = event_tx.clone();
-        rt.spawn(async move { run_engine(s, et, tx_active_for_engine, settings_watch_rx, analysis_save_rx).await; });
+        rt.spawn(async move { run_engine(s, et, tx_active_for_engine, settings_watch_rx).await; });
 
         // Auto-launch rigctld if hamlib enabled and rig configured — same as MSK2K
         let mut rigctld_guard: Option<ProcessGuard> = None;
@@ -532,8 +543,6 @@ impl Fsk441App {
         active_tx_idx: None,
         wf_columns: Vec::new(),
         df_dots: Vec::new(),
-        analysis_save_tx,
-        last_capture_id: None,
         qso_time_on: None,
         qso_logged: false,
         adif_logger: AdifLogger::new(&AdifLogger::default_path()),
@@ -545,6 +554,13 @@ impl Fsk441App {
             base_freq_hz: None,
             freq_edit: String::new(),
             freq_editing: false, cat_connected: false, last_cat_rx: None, _rigctld: rigctld_guard, settings, _runtime: rt,
+        // Second-pass decoder
+        event_tx: event_tx_ui,
+        second_pass_db_path: {
+            let mut p = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+            p.push(".fsk441"); p.push("fsk441.db");
+            p.to_string_lossy().to_string()
+        },
         }
     }
 
@@ -581,6 +597,8 @@ impl Fsk441App {
                         my_call: self.settings.my_call.clone(),
                         df_bin_hz: Some(acc.df_bin_hz),
                         passed_threshold: true,
+                        is_second_pass:   false,
+                        second_pass_chars: vec![],
                     };
                     // Update seen callsigns — exclude MYCALL
                     let my = self.settings.my_call.to_uppercase();
@@ -625,22 +643,114 @@ impl Fsk441App {
                     continue;
                 }
                 EngineEvent::AnalysisSaved(capture_id, n) => {
-                    // Delete from DB immediately — ring buffer in RAM is the live store
-                    // analysis_pings is only a transit store for the optimiser
-                    // (optimiser reads then we clean up to keep DB lean)
-                    self.last_capture_id = Some((capture_id, n));
-                    log::info!("[UI] Analysis saved: capture={} n={}", capture_id, n);
+                    // Auto-save just completed — spawn second-pass immediately during TX.
+                    log::info!("[UI] Analysis saved: capture={} n={} — spawning second pass", capture_id, n);
+                    let my_call = self.settings.my_call.trim().to_uppercase();
+                    let their_call = self.settings.their_call_hint.clone();
+                    let their_loc = {
+                        let l = self.their_loc_edit.trim().to_uppercase();
+                        if l.len() >= 4 { Some(l) } else { None }
+                    };
+                    let report_sent = Some(self.report_sent.clone());
+                    let report_rcvd = if !self.report_rcvd.is_empty() {
+                        Some(self.report_rcvd.clone())
+                    } else { None };
+                    let stage = match self.active_tx_idx {
+                        Some(0) => second_pass::QsoStage::CallingCq,
+                        Some(1) => second_pass::QsoStage::CallingStation,
+                        Some(2) => second_pass::QsoStage::SentReport,
+                        Some(3) => second_pass::QsoStage::SentRReport,
+                        _       => if their_call.is_some() {
+                            second_pass::QsoStage::Idle
+                        } else {
+                            second_pass::QsoStage::CallingCq
+                        },
+                    };
+                    let ctx = second_pass::QsoContext {
+                        my_call, their_call, their_loc,
+                        report_sent, report_rcvd, stage,
+                        noise_floor: self.settings.min_conf,
+                        retain_after_run: self.settings.save_max_data,
+                    };
+                    let et = self.event_tx.clone();
+                    let db = self.second_pass_db_path.clone();
+                    self._runtime.spawn(async move {
+                        let res = tokio::task::spawn_blocking(move || {
+                            second_pass::run(&db, capture_id, &ctx)
+                        }).await;
+                        if let Ok(Ok(results)) = res {
+                            if !results.is_empty() {
+                                let _ = et.send(EngineEvent::SecondPassDecodes(results));
+                            }
+                        }
+                    });
+                    let _ = n;
+                    continue;
+                }
+                EngineEvent::SecondPassDecodes(results) => {
+                    log::info!("[UI] Second-pass: {} recoveries", results.len());
+                    for r in results {
+                        // Parse detected_at timestamp for chronological insertion
+                        let ts = chrono::DateTime::parse_from_rfc3339(&r.detected_at)
+                            .map(|dt| dt.with_timezone(&chrono::Utc))
+                            .unwrap_or_else(|_| chrono::Utc::now());
+
+                        // Build per-char confirmed map from hypothesis
+                        let hyp_chars: Vec<char> = r.hypothesis.chars().collect();
+                        let mut second_pass_chars: Vec<(char, bool)> = Vec::new();
+                        let mut conf_iter = r.confirmed_chars.iter().peekable();
+                        for &hc in &hyp_chars {
+                            let confirmed = if let Some((cc, _)) = conf_iter.peek() {
+                                if *cc == hc.to_ascii_uppercase() {
+                                    conf_iter.next();
+                                    true
+                                } else { false }
+                            } else { false };
+                            second_pass_chars.push((hc, confirmed));
+                        }
+
+                        let entry = DecodeEntry {
+                            timestamp:   ts,
+                            df_hz:       r.df_hz,
+                            ccf_ratio:   r.ccf_ratio,
+                            duration_ms: 0.0,
+                            confidence:  r.mean_confidence,
+                            score:       0,
+                            raw:         r.hypothesis.clone(),
+                            callsigns:   vec![],
+                            locator:     None,
+                            report:      None,
+                            is_cq:       false,
+                            char_confs:  vec![],
+                            is_accumulated: false,
+                            my_call:     String::new(),
+                            df_bin_hz:   None,
+                            passed_threshold: true,
+                            is_second_pass:   true,
+                            second_pass_chars,
+                        };
+
+                        // Insert chronologically so second-pass rows appear
+                        // at the timestamp of the original ping, not when scored
+                        let pos = self.decodes.partition_point(|d| d.timestamp <= ts);
+                        self.decodes.insert(pos, entry);
+                    }
                     continue;
                 }
                 EngineEvent::Spectrum(bins, rms) => {
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
-                    let slot = now_ms / 30_000;
-                    if slot != self.wf_period_idx {
-                        self.wf_columns.clear();
-                        self.wf_amplitude.clear();
-                        self.wf_period_idx = slot;
-                        self.df_dots.clear(); // fresh each 30s slot
+                    // Only clear on slot boundary when in RX — avoids wiping the
+                    // waterfall right at TX→RX transition due to wall-clock misalignment.
+                    let is_tx = self.tx_active.load(std::sync::atomic::Ordering::Relaxed);
+                    if !is_tx {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+                        let slot = now_ms / 30_000;
+                        if slot != self.wf_period_idx {
+                            self.wf_columns.clear();
+                            self.wf_amplitude.clear();
+                            self.wf_period_idx = slot;
+                            self.df_dots.clear();
+                        }
                     }
                     self.wf_columns.push(bins);
                     self.wf_amplitude.push(rms);
@@ -788,6 +898,7 @@ impl Fsk441App {
         // tx_active is controlled solely by hamlib PTT events — do NOT set here
         // Setting it here causes the spectrum to gate immediately on button press
         // even when transmitting won't start until the next TX slot
+        // Second-pass is spawned from the AnalysisSaved handler.
     }
 
 
@@ -1012,9 +1123,10 @@ impl eframe::App for Fsk441App {
 
                         if self.freq_editing {
                             // Active TextEdit — amber, accepts digit input
+                            // Pre-populated with current kHz so user sees what they're changing
                             let resp = ui.add(
                                 egui::TextEdit::singleline(&mut self.freq_edit)
-                                    .desired_width(28.0)
+                                    .desired_width(32.0)
                                     .font(egui::TextStyle::Monospace)
                                     .text_color(col_amb)
                                     .frame(true)
@@ -1025,12 +1137,13 @@ impl eframe::App for Fsk441App {
                             self.freq_edit.retain(|c| c.is_ascii_digit());
                             if self.freq_edit.len() > 3 { self.freq_edit.truncate(3); }
 
-                            // Commit on: 3rd digit entered, Enter, or focus lost
-                            let commit = (self.freq_edit.len() == 3 && resp.changed())
-                                || resp.lost_focus()
-                                || ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            // Commit on: 3rd digit entered OR Enter — no blank-box loop
+                            let auto_commit = self.freq_edit.len() == 3 && resp.changed();
+                            let enter_commit = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            let focus_lost   = resp.lost_focus()
+                                && !ui.input(|i| i.key_pressed(egui::Key::Escape));
 
-                            if commit {
+                            if auto_commit || enter_commit || focus_lost {
                                 if self.freq_edit.len() == 3 {
                                     if let Ok(new_k) = self.freq_edit.parse::<u64>() {
                                         let new_f = mhz * 1_000_000 + new_k * 1_000;
@@ -1041,22 +1154,38 @@ impl eframe::App for Fsk441App {
                                 }
                                 self.freq_edit.clear();
                                 self.freq_editing = false;
+                                // Explicitly drop egui focus so no underline or cursor lingers
+                                ui.memory_mut(|m| m.surrender_focus(resp.id));
                             }
-                            // Escape cancels
+                            // Escape cancels without sending
                             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                                 self.freq_edit.clear();
                                 self.freq_editing = false;
                             }
                         } else {
-                            // Idle — green label, click to start editing
-                            let r = ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(format!("{:03}", khz))
-                                        .monospace().size(14.0).color(col).strong()
-                                ).sense(egui::Sense::click())
+                            // Idle — click to start editing.
+                            // Drawn via painter (not egui::Label) to avoid the default
+                            // clickable-label underline that egui adds to interactive labels.
+                            let text = format!("{:03}", khz);
+                            let galley = ui.fonts(|f| f.layout_no_wrap(
+                                text.clone(),
+                                egui::FontId::monospace(14.0),
+                                col,
+                            ));
+                            let (rect, r) = ui.allocate_exact_size(
+                                galley.size(), egui::Sense::click()
                             );
-                            if r.clicked() {
-                                self.freq_edit.clear();
+                            if r.hovered() {
+                                ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::Text);
+                            }
+                            let clicked = r.clicked();
+                            ui.painter().galley(rect.min, galley, col);
+                            r.on_hover_text(format!(
+                                "Click to change — type 3 digits (e.g. {})", text
+                            ));
+                            if clicked {
+                                // Pre-populate with current value so it's never a blank box
+                                self.freq_edit = format!("{:03}", khz);
                                 self.freq_editing = true;
                             }
                         }
@@ -1077,7 +1206,7 @@ impl eframe::App for Fsk441App {
                     }
                 } else {
                     ui.label(egui::RichText::new("No CAT")
-                        .monospace().color(egui::Color32::GRAY));
+                        .monospace().color(egui::Color32::from_gray(180)));
                 }
                 ui.separator();
 
@@ -1198,7 +1327,7 @@ impl eframe::App for Fsk441App {
                     if field_locked {
                         // Show lock + click to unlock
                         if ui.label(egui::RichText::new("[locked]")
-                            .small().color(egui::Color32::YELLOW))
+                            .color(egui::Color32::YELLOW))
                             .on_hover_text("Click ⟳ Clear to unlock")
                             .clicked() {}
                     } else {
@@ -1348,17 +1477,16 @@ impl eframe::App for Fsk441App {
                         } else {
                             log::info!("[APP] {} clicked: {}", labels[i], msg);
                             self.qso_log.push(format!("{}: {}", labels[i], msg));
-                            if i == 1 || i == 2 {
-                                // Auto-set their_call_hint from field if not already set
-                                // Handles the case where TX is pressed without Set
-                                let tc = self.their_call_edit.trim().to_uppercase();
-                                if !tc.is_empty() && self.settings.their_call_hint.is_none() {
-                                    self.settings.their_call_hint = Some(tc);
-                                }
-                                if self.qso_time_on.is_none() {
-                                    self.qso_time_on = Some(chrono::Utc::now());
-                                    self.qso_logged = false;
-                                }
+                            // Auto-set their_call_hint from field if not already set
+                            let tc = self.their_call_edit.trim().to_uppercase();
+                            if !tc.is_empty() && self.settings.their_call_hint.is_none() {
+                                self.settings.their_call_hint = Some(tc);
+                                let _ = self.settings_watch_tx.send(self.settings.clone());
+                            }
+                            // Start QSO timer on first TX press of any kind
+                            if self.qso_time_on.is_none() {
+                                self.qso_time_on = Some(chrono::Utc::now());
+                                self.qso_logged = false;
                             }
                             self.active_tx_idx = Some(i);
                             self.send_tx(&msg);
@@ -1377,18 +1505,22 @@ impl eframe::App for Fsk441App {
             } // end TX rows for loop
             }); // end left vertical
 
-            // ── Right: HALT/Clear + Accumulated decodes ───────────────────
+            // ── Right: STOP/Clear + Accumulated decodes ───────────────────
             ui.separator();
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
-                    if ui.button(
-                        egui::RichText::new("■ HALT").color(egui::Color32::RED).strong()
-                    ).clicked() {
-                        log::info!("[APP] HALT button clicked");
+                    let is_tx = self.is_transmitting || self.active_tx_idx.is_some();
+                    let stop_text = if is_tx {
+                        egui::RichText::new("■ STOP").color(egui::Color32::RED).strong()
+                    } else {
+                        egui::RichText::new("■ STOP").color(egui::Color32::from_gray(170))
+                    };
+                    if ui.add_enabled(is_tx, egui::Button::new(stop_text)).clicked() {
+                        log::info!("[APP] STOP button clicked");
                         self.halt_tx();
                         self.active_tx_idx = None;
                         self.qso = QsoState::Idle;
-                        self.qso_log.push("HALTED".to_string());
+                        self.qso_log.push("STOPPED".to_string());
                     }
                     if ui.button(egui::RichText::new("⟳ Clear")
                         .color(egui::Color32::from_gray(180))).clicked()
@@ -1437,7 +1569,7 @@ impl eframe::App for Fsk441App {
                         if let Some(rec) = self.adif_log.last() {
                             let rec = rec.clone();
                             if ui.button(egui::RichText::new("📄 Export")
-                                .small().color(egui::Color32::from_gray(180)))
+                                .color(egui::Color32::from_gray(180)))
                                 .on_hover_text("Copy QSO transcript to clipboard").clicked()
                             {
                                 let transcript = self.export_qso_transcript(&rec);
@@ -1458,7 +1590,7 @@ impl eframe::App for Fsk441App {
                         if !rpt_valid {
                             // Report missing/invalid — show inline edit + log button
                             ui.label(egui::RichText::new("Rpt Rcvd:")
-                                .small().color(egui::Color32::from_rgb(255, 180, 50)));
+                                .color(egui::Color32::from_rgb(255, 180, 50)));
                             ui.add(egui::TextEdit::singleline(&mut self.report_rcvd)
                                 .desired_width(38.0)
                                 .hint_text("26-59")
@@ -1467,7 +1599,7 @@ impl eframe::App for Fsk441App {
                         let btn_color = if rpt_valid {
                             egui::Color32::from_rgb(50, 200, 80)
                         } else {
-                            egui::Color32::from_gray(120)
+                            egui::Color32::from_gray(170)
                         };
                         let btn = ui.add_enabled(
                             rpt_valid,
@@ -1574,43 +1706,54 @@ impl eframe::App for Fsk441App {
                         let fmt = |t: &str| if t.len()>=4 { format!("{}:{}", &t[0..2], &t[2..4]) } else { t.to_string() };
                         ui.label(egui::RichText::new(format!("{}-{}",
                             fmt(&rec.time_on), fmt(&rec.time_off)))
-                            .small().color(egui::Color32::from_gray(140)));
+                            .color(egui::Color32::from_gray(170)));
                         ui.add_space(4.0);
                         ui.label(egui::RichText::new(format!("S:{} R:{}",
                             rec.rst_sent, rec.rst_rcvd))
-                            .small().monospace().color(egui::Color32::from_rgb(255, 200, 80)));
+                            .monospace().color(egui::Color32::from_rgb(255, 200, 80)));
                         if !rec.gridsquare.is_empty() {
                             ui.add_space(4.0);
                             ui.label(egui::RichText::new(&rec.gridsquare)
-                                .small().monospace().color(egui::Color32::from_gray(150)));
+                                .monospace().color(egui::Color32::from_gray(170)));
                         }
                     } else {
                         ui.label(egui::RichText::new("None logged yet")
-                            .small().color(egui::Color32::from_gray(100)));
+                            .color(egui::Color32::from_gray(170)));
                     }
                 });
 
                 ui.add_space(4.0);
 
                 // ── Accumulated decodes panel ─────────────────────────────
-                // Shows ★ rows: synthesised best-guess from multiple weak pings
-                // ── Accumulated decodes ──────────────────────────────────
-                // Only show entries with conf≥0.45 to suppress noise merges.
-                // In QSO mode, prefer entries at the QSO station's DF bin.
-                // Sort by confidence descending — best decode at top.
+                // Shows ★ rows only when no direct decode exists for the same
+                // DF bin in the last 120 seconds. If direct decodes are coming
+                // through cleanly, the accumulator adds nothing useful.
                 let their_hint = self.settings.their_call_hint.clone();
+                let now_ts = chrono::Utc::now();
+                let cutoff_120s = now_ts - chrono::Duration::seconds(120);
+
                 let mut acc_decodes: Vec<_> = self.decodes.iter()
                     .filter(|e| e.is_accumulated && e.confidence >= 0.45)
+                    .filter(|acc| {
+                        // Suppress if any direct decode shares the same DF bin
+                        // and was received in the last 120 seconds
+                        let acc_bin = acc.df_bin_hz;
+                        !self.decodes.iter().any(|d| {
+                            !d.is_accumulated
+                                && d.timestamp > cutoff_120s
+                                && d.df_bin_hz == acc_bin
+                        })
+                    })
                     .cloned()
                     .collect();
                 // Sort best confidence first
                 acc_decodes.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
-                // In QSO mode, cap at 3 entries — too many is confusing
+                // In QSO mode, cap at 3 entries
                 if their_hint.is_some() { acc_decodes.truncate(3); }
 
                 if !acc_decodes.is_empty() {
                     ui.label(egui::RichText::new("★ Accumulated")
-                        .small().strong()
+                        .strong()
                         .color(egui::Color32::from_rgb(220, 180, 50)));
                     ui.separator();
                     for e in &acc_decodes {
@@ -1641,7 +1784,7 @@ impl eframe::App for Fsk441App {
                                 egui::Color32::from_rgb(255, 210, 80)
                             };
                             ui.label(egui::RichText::new(text)
-                                .monospace().small().color(text_col));
+                                .monospace().color(text_col));
                         });
                         // Show DF bin + conf + time
                         let df_str = e.df_bin_hz
@@ -1651,12 +1794,12 @@ impl eframe::App for Fsk441App {
                             format!("{}conf {:.2}  {}",
                                 df_str, e.confidence,
                                 e.timestamp.format("%H:%M:%S")))
-                            .small().color(egui::Color32::from_gray(130)));
+                            .color(egui::Color32::from_gray(170)));
                         ui.add_space(2.0);
                     }
                 } else {
                     ui.label(egui::RichText::new("No accumulated decodes yet")
-                        .small().color(egui::Color32::from_gray(80)));
+                        .color(egui::Color32::from_gray(170)));
                 }
             }); // end right vertical
             }); // end outer horizontal
@@ -1667,7 +1810,7 @@ impl eframe::App for Fsk441App {
                 ui.separator();
                 let start = self.qso_log.len().saturating_sub(4);
                 for e in &self.qso_log[start..] {
-                    ui.label(egui::RichText::new(e).small()
+                    ui.label(egui::RichText::new(e)
                         .color(egui::Color32::from_rgb(160, 160, 160)));
                 }
             }
@@ -1737,17 +1880,19 @@ impl eframe::App for Fsk441App {
                         }
                     }
 
-                    // Frequency axis labels (right edge, Y axis)
-                    for khz in [0u32, 500, 1000, 1500, 2000, 2500, 3000] {
-                        let bin = hz_to_bin(khz as f32);
+                    // Frequency axis — just 0 (DC, bottom) and 3k (top)
+                    for (hz, label) in [(0u32, "0"), (3000u32, "3k")] {
+                        let bin = hz_to_bin(hz as f32);
                         if bin >= DISPLAY_BINS { continue; }
-                        let y = rect.bottom() - bin as f32 * bin_h;
+                        let y_raw = rect.bottom() - bin as f32 * bin_h;
+                        // Raise the 0 label by half its font height so it clears the border
+                        let y = if hz == 0 { y_raw - 6.0 } else { y_raw };
                         painter.text(
-                            egui::pos2(rect.right() - 2.0, y),
+                            egui::pos2(rect.right() - 4.0, y),
                             egui::Align2::RIGHT_CENTER,
-                            format!("{}k", khz / 1000),
-                            egui::FontId::monospace(8.0),
-                            egui::Color32::from_rgba_unmultiplied(180, 180, 180, 80),
+                            label,
+                            egui::FontId::monospace(10.0),
+                            egui::Color32::from_rgba_unmultiplied(200, 200, 200, 160),
                         );
                     }
 
@@ -1792,13 +1937,13 @@ impl eframe::App for Fsk441App {
                 }
 
                 painter.rect_stroke(rect, 0.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(60)));
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(170)));
             }
 
-            // ── DF Scatter Strip: X=time (synced to waterfall), Y=DF ±500Hz ──
+            // ── DF Scatter Strip: X=time (synced to waterfall), Y=DF ±100Hz ──
             {
                 let strip_h  = 40.0f32;
-                let df_range = 500.0f32; // ±500 Hz maps to top/bottom
+                let df_range = 100.0f32; // ±100 Hz maps to top/bottom
                 let avail_w  = ui.available_width();
                 let (rect, _) = ui.allocate_exact_size(
                     egui::vec2(avail_w, strip_h), egui::Sense::hover()
@@ -1853,16 +1998,16 @@ impl eframe::App for Fsk441App {
                 }
 
                 // Y-axis labels
-                let label_col = egui::Color32::from_gray(80);
+                let label_col = egui::Color32::from_gray(170);
                 painter.text(egui::pos2(rect.right() - 38.0, rect.top() + 2.0),
-                    egui::Align2::LEFT_TOP, "+500Hz", egui::FontId::proportional(9.0), label_col);
+                    egui::Align2::LEFT_TOP, "+100Hz", egui::FontId::proportional(9.0), label_col);
                 painter.text(egui::pos2(rect.right() - 38.0, rect.bottom() - 11.0),
-                    egui::Align2::LEFT_TOP, "-500Hz", egui::FontId::proportional(9.0), label_col);
+                    egui::Align2::LEFT_TOP, "-100Hz", egui::FontId::proportional(9.0), label_col);
                 painter.text(egui::pos2(rect.right() - 22.0, y_zero - 5.0),
                     egui::Align2::LEFT_TOP, "0", egui::FontId::proportional(9.0), label_col);
 
                 painter.rect_stroke(rect, 0.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(40)));
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(170)));
             }
 
             ui.add_space(2.0);
@@ -1870,26 +2015,27 @@ impl eframe::App for Fsk441App {
                 ui.label(egui::RichText::new("Decoded Pings").strong()
                     .color(egui::Color32::from_rgb(180, 200, 255)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-
-                    // Analysis ring buffer save — always active, always triggers
-                    if ui.add(egui::Button::new(
-                        egui::RichText::new("💾 Save 30s").small()
-                            .color(egui::Color32::from_gray(160)))
-                        .small())
-                        .on_hover_text("Save last 30s of soft-bit data for analysis")
-                        .clicked()
-                    {
-                        let _ = self.analysis_save_tx.send(());
-                    }
-                    // Show last save confirmation as a dim label
-                    if let Some((_cid, n)) = self.last_capture_id {
-                        ui.label(egui::RichText::new(format!("✓{}p", n)).small()
-                            .color(egui::Color32::from_rgb(80, 180, 80)));
+                    if ui.button("Clear").clicked() {
+                        self.clear_decodes();
                     }
                     ui.separator();
-                    if ui.small_button("Clear").clicked() {
-                        self.clear_decodes();
-                        self.last_capture_id = None;
+                    // Max Data toggle — auto-saves ring buffer at every TX start
+                    let max_col = if self.settings.save_max_data {
+                        egui::Color32::from_rgb(80, 200, 220)
+                    } else {
+                        egui::Color32::from_gray(160)
+                    };
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new("📊 Max Data").color(max_col)))
+                        .on_hover_text(if self.settings.save_max_data {
+                            "Max Data ON — soft data saved at every TX and retained in DB. Click to disable."
+                        } else {
+                            "Max Data OFF — soft data scored then discarded. Click to retain for analysis."
+                        })
+                        .clicked()
+                    {
+                        self.settings.save_max_data = !self.settings.save_max_data;
+                        save_config(&self.settings);
                     }
                 });
             });
@@ -1907,6 +2053,49 @@ impl eframe::App for Fsk441App {
                     for i in 0..self.decodes.len() {
                         let e   = &self.decodes[i];
                         if e.is_accumulated { continue; } // shown in QSO panel
+
+                        // ── Second-pass recovery row ──────────────────────────
+                        if e.is_second_pass {
+                            let header = format!("{:<10} {:>+7.0}          ",
+                                e.timestamp.format("%H:%M:%S"), e.df_hz);
+                            let their_hint = self.settings.their_call_hint.clone();
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                // Dim header
+                                ui.label(egui::RichText::new(&header)
+                                    .monospace().italics()
+                                    .color(egui::Color32::from_gray(140)));
+                                // ⟳ prefix
+                                ui.label(egui::RichText::new("⟳ ")
+                                    .monospace().italics()
+                                    .color(egui::Color32::from_rgb(80, 200, 220)));
+                                // Hypothesis chars — confirmed in cyan brackets, rest dim italic
+                                for &(hc, confirmed) in &e.second_pass_chars {
+                                    let highlight = their_hint.as_deref()
+                                        .map(|h| h.contains(hc.to_ascii_uppercase()))
+                                        .unwrap_or(false);
+                                    if confirmed {
+                                        let col = if highlight {
+                                            egui::Color32::from_rgb(80, 255, 160)
+                                        } else {
+                                            egui::Color32::from_rgb(80, 200, 220)
+                                        };
+                                        ui.label(egui::RichText::new(format!("[{}]", hc))
+                                            .monospace().italics().strong().color(col));
+                                    } else {
+                                        ui.label(egui::RichText::new(hc.to_string())
+                                            .monospace().italics()
+                                            .color(egui::Color32::from_gray(110)));
+                                    }
+                                }
+                                // Confidence annotation
+                                ui.label(egui::RichText::new(
+                                    format!("  {:.2}", e.confidence))
+                                    .color(egui::Color32::from_gray(120)));
+                            });
+                            continue;
+                        }
+
                         let sel = self.selected == Some(i);
                         let _e_passed = e.passed_threshold;
                         let _e_accum  = e.is_accumulated;
@@ -1945,7 +2134,7 @@ impl eframe::App for Fsk441App {
                             // Header in dim grey monospace
                             ui.label(egui::RichText::new(&header)
                                 .monospace()
-                                .color(egui::Color32::from_gray(110)));
+                                .color(egui::Color32::from_gray(170)));
 
                             // Render only the meaningful portion of the decode:
                             // trim leading/trailing characters below conf_thresh_show.
@@ -1972,7 +2161,7 @@ impl eframe::App for Fsk441App {
                             let trimmed_back  = last + 3 < chars.len();
                             if trimmed_front {
                                 ui.label(egui::RichText::new("…").monospace()
-                                    .color(egui::Color32::from_gray(50)));
+                                    .color(egui::Color32::from_gray(170)));
                             }
 
                             for (ci, ch) in chars.iter().enumerate() {
@@ -2000,15 +2189,7 @@ impl eframe::App for Fsk441App {
 
                             if trimmed_back {
                                 ui.label(egui::RichText::new("…").monospace()
-                                    .color(egui::Color32::from_gray(50)));
-                            }
-
-                            // 📋 Copy button — small, at end of row
-                            if ui.add(egui::Button::new(
-                                egui::RichText::new("⧉").size(9.0)
-                                    .color(egui::Color32::from_gray(100))
-                            ).frame(false).small()).on_hover_text("Copy decode to clipboard").clicked() {
-                                ui.output_mut(|o| o.copied_text = e.raw.trim().to_string());
+                                    .color(egui::Color32::from_gray(170)));
                             }
                         });
 
@@ -2075,13 +2256,13 @@ impl eframe::App for Fsk441App {
                                 .collect();
                             if foreign.len() > 1 {
                                 ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("  → ").small()
+                                    ui.label(egui::RichText::new("  → ")
                                         .color(egui::Color32::YELLOW));
                                     for call in &foreign {
                                         if ui.add(egui::Button::new(
-                                            egui::RichText::new(call).small().monospace()
+                                            egui::RichText::new(call).monospace()
                                                 .color(egui::Color32::from_rgb(100, 200, 255))
-                                        ).small().frame(true)).clicked() {
+                                        ).frame(true)).clicked() {
                                             self.their_call_edit = call.clone();
                                             self.tx_msgs_key.clear();
                                             if let Some(loc) = &e.locator {
@@ -2207,9 +2388,6 @@ impl eframe::App for Fsk441App {
                                 ui.end_row();
                             });
                         });
-                        ui.label(egui::RichText::new(
-                            "Start rigctld before launching FSK441, e.g:\n  rigctld -m 3081 -r /dev/cu.usbserial-XXX -s 19200")
-                            .small().color(egui::Color32::GRAY));
                     }
 
                     // ── Audio Hardware ────────────────────────────────────
@@ -2224,7 +2402,7 @@ impl eframe::App for Fsk441App {
                         }
                         if self.settings.sel_in.is_none() || self.settings.sel_out.is_none() {
                             ui.label(egui::RichText::new("⚠ No device selected")
-                                .small().color(egui::Color32::from_rgb(255, 180, 0)));
+                                .color(egui::Color32::from_rgb(255, 180, 0)));
                         }
                     });
 
@@ -2269,8 +2447,10 @@ impl eframe::App for Fsk441App {
                     egui::Grid::new("filt").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                         ui.label("cty.dat path:"); ui.text_edit_singleline(&mut self.settings.cty_path); ui.end_row();
                         ui.label("Max range (km):"); ui.add(egui::Slider::new(&mut self.settings.max_km, 500.0..=5000.0).integer()); ui.end_row();
-                        ui.label("Min CCF ratio:"); ui.add(egui::Slider::new(&mut self.settings.min_ccf, 30.0..=500.0).integer()); ui.end_row();
-                        ui.label("Min confidence:"); ui.add(egui::Slider::new(&mut self.settings.min_conf, 0.35..=0.90)); ui.end_row();
+                        ui.label("Arm 1 CCF min:"); ui.add(egui::Slider::new(&mut self.settings.min_ccf, 30.0..=500.0).integer()); ui.end_row();
+                        ui.label("Arm 1 conf min:"); ui.add(egui::Slider::new(&mut self.settings.min_conf, 0.35..=0.95).fixed_decimals(2)); ui.end_row();
+                        ui.label("Arm 2 CCF min:"); ui.add(egui::Slider::new(&mut self.settings.arm2_ccf, 10.0..=200.0).integer()); ui.end_row();
+                        ui.label("Arm 2 conf min:"); ui.add(egui::Slider::new(&mut self.settings.arm2_conf, 0.50..=0.99).fixed_decimals(2)); ui.end_row();
                         ui.end_row();
                         // Optimiser suggestion
                         ui.label("");
@@ -2278,26 +2458,28 @@ impl eframe::App for Fsk441App {
                             if s.is_improvement() {
                                 ui.vertical(|ui| {
                                     ui.label(egui::RichText::new(format!(
-                                        "Optimiser: CCF≥{:.0}+conf≥{:.2} | CCF≥{:.0}+conf≥{:.2}  F1 {:.2}→{:.2}",
+                                        "Optimiser suggests  Arm1: CCF≥{:.0} conf≥{:.2}  Arm2: CCF≥{:.0} conf≥{:.2}  F1 {:.3}→{:.3}",
                                         s.suggested_arm1_ccf, s.suggested_arm1_conf,
                                         s.suggested_arm2_ccf, s.suggested_arm2_conf,
                                         s.current_f1, s.suggested_f1,
-                                    )).small().color(egui::Color32::from_rgb(100, 220, 100)));
-                                    if ui.small_button("✓ Apply").clicked() {
-                                        self.settings.min_ccf  = s.suggested_arm1_ccf;
-                                        self.settings.min_conf = s.suggested_arm1_conf;
+                                    )).color(egui::Color32::from_rgb(100, 220, 100)));
+                                    if ui.button("✓ Apply optimiser suggestion").clicked() {
+                                        self.settings.min_ccf   = s.suggested_arm1_ccf;
+                                        self.settings.min_conf  = s.suggested_arm1_conf;
+                                        self.settings.arm2_ccf  = s.suggested_arm2_ccf;
+                                        self.settings.arm2_conf = s.suggested_arm2_conf;
                                         let _ = self.settings_watch_tx.send(self.settings.clone());
                                     }
                                 });
                             } else {
                                 ui.label(egui::RichText::new(format!(
-                                    "Optimiser: thresholds near-optimal (F1={:.2}, {:.0}h, {}sig/{}noise)",
+                                    "Optimiser: thresholds near-optimal  F1={:.3}  ({:.0}h window, {}sig/{}noise)",
                                     s.current_f1, s.window_hours, s.n_signal_pings, s.n_noise_pings
-                                )).small().color(egui::Color32::from_gray(110)));
+                                )).color(egui::Color32::from_gray(170)));
                             }
                         } else {
                             ui.label(egui::RichText::new("Optimiser: runs every 30min once signals seen")
-                                .small().color(egui::Color32::from_gray(100)));
+                                .color(egui::Color32::from_gray(170)));
                         }
                         ui.end_row();
                     });
@@ -2338,7 +2520,7 @@ impl eframe::App for Fsk441App {
 
 // ─── Engine ───────────────────────────────────────────────────────────────────
 
-async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEvent>, tx_active: std::sync::Arc<std::sync::atomic::AtomicBool>, mut settings_rx: tokio::sync::watch::Receiver<Settings>, mut analysis_save_rx: mpsc::UnboundedReceiver<()>) {
+async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEvent>, tx_active: std::sync::Arc<std::sync::atomic::AtomicBool>, mut settings_rx: tokio::sync::watch::Receiver<Settings>) {
     let mut settings = settings; // mutable local copy
 
     let qth = Qth::from_maidenhead(&settings.my_loc).unwrap_or_default();
@@ -2394,22 +2576,37 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
     tokio::spawn(async move {
         let mut rx = audio_rx;
         let mut was_tx = false;
+        // Post-TX blanking: discard audio for a fixed window after tx_active goes false.
+        // Covers the ~93ms cpal drain tail + rig TX→RX switch time. Without this,
+        // our own transmitted audio leaks back through the mic and gets decoded.
+        // 250ms covers cpal drain (93ms) + typical rig switch time (100ms) + margin.
+        const POST_TX_BLANK_MS: u64 = 250;
+        let mut blank_until: Option<std::time::Instant> = None;
         while let Some(chunk) = rx.recv().await {
             let is_tx_now = tx_active_fanout.load(std::sync::atomic::Ordering::Relaxed);
             if was_tx && !is_tx_now {
-                // TX→RX transition: drain all queued TX audio from channel before resuming
-                // These are TX audio chunks that backed up in the buffer during transmission
+                // TX→RX transition: drain queued chunks and start blanking window
                 let mut drained = 0u32;
                 while rx.try_recv().is_ok() { drained += 1; }
-                log::info!("[FANOUT] TX→RX: drained {} queued TX chunks", drained);
+                blank_until = Some(std::time::Instant::now()
+                    + std::time::Duration::from_millis(POST_TX_BLANK_MS));
+                log::info!("[FANOUT] TX→RX: drained {} chunks, blanking {}ms", drained, POST_TX_BLANK_MS);
                 was_tx = false;
                 continue;
             }
             was_tx = is_tx_now;
-            if !is_tx_now {
-                let _ = audio_spec_tx.send(chunk.clone());
-                let _ = fanout_ping_tx.send(chunk);
+            if is_tx_now {
+                continue; // TX — discard
             }
+            // RX — check blanking window
+            if let Some(blank_end) = blank_until {
+                if std::time::Instant::now() < blank_end {
+                    continue; // Still in post-TX blank — discard
+                }
+                blank_until = None;
+            }
+            let _ = audio_spec_tx.send(chunk.clone());
+            let _ = fanout_ping_tx.send(chunk);
         }
     });
 
@@ -2433,28 +2630,10 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
     let engine_start = std::time::Instant::now();
     const STARTUP_MS: u128 = 3000;
     let mut tx_cooldown_until: Option<std::time::Instant> = None;
+    let mut was_transmitting = false;
 
     while let Some(ping) = ping_rx.recv().await {
         let is_tx = tx_active.load(std::sync::atomic::Ordering::Relaxed);
-
-        // Check for analysis save request (non-blocking)
-        if analysis_save_rx.try_recv().is_ok() {
-            if let Some(ref s) = store {
-                let entries: Vec<AnalysisPing> = analysis_ring.iter().cloned().collect();
-                let n = entries.len();
-                match s.save_analysis(&entries) {
-                    Ok(cid) => {
-                        let _ = event_tx.send(EngineEvent::AnalysisSaved(cid, n));
-                        // Immediately delete — data was written for the optimiser which
-                        // reads synchronously in save_analysis; DB doesn't need to keep it
-                        let _ = s.delete_analysis(cid);
-                    }
-                    Err(e) => log::error!("[DB] save_analysis failed: {}", e),
-                }
-            } else {
-                log::warn!("[DB] Cannot save analysis — no DB connection");
-            }
-        }
 
         // Background threshold optimiser — every 30 minutes
         if last_optimiser_run.elapsed() >= std::time::Duration::from_secs(30 * 60) {
@@ -2462,7 +2641,7 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
             let db = optimiser_db_path.clone();
             let et = event_tx.clone();
             let (a1c, a1f, a2c, a2f) = (
-                settings.min_ccf, settings.min_conf, 25.0f32, 0.75f32,
+                settings.min_ccf, settings.min_conf, settings.arm2_ccf, settings.arm2_conf,
             );
             // Spawn blocking task so it doesn't block the audio loop
             tokio::task::spawn_blocking(move || {
@@ -2503,8 +2682,26 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
             }
         }
 
-        // Drain any pings that queued during TX — they are our own audio
+        // Drain any pings that queued during TX — they are our own audio.
+        // On the first TX frame, auto-save the ring buffer for second-pass scoring.
         if is_tx {
+            // Auto-save ring buffer on TX→RX transition detection (first is_tx frame)
+            if !was_transmitting {
+                if let Some(ref s) = store {
+                    let entries: Vec<AnalysisPing> = analysis_ring.iter().cloned().collect();
+                    let n = entries.len();
+                    if n > 0 {
+                        match s.save_analysis(&entries) {
+                            Ok(cid) => {
+                                let _ = event_tx.send(EngineEvent::AnalysisSaved(cid, n));
+                                log::info!("[2PASS] Auto-saved {} pings as capture_id={} at TX start", n, cid);
+                            }
+                            Err(e) => log::error!("[DB] Auto-save on TX start failed: {}", e),
+                        }
+                    }
+                }
+            }
+            was_transmitting = true;
             frag_acc.prune_older_than(300); // housekeeping during TX
             // Set cooldown so we reject ring-buffer bleed after TX ends
             tx_cooldown_until = Some(std::time::Instant::now()
@@ -2513,6 +2710,7 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
             while ping_rx.try_recv().is_ok() {}
             continue;
         }
+        was_transmitting = false;
 
         // Reject pings during cooldown after TX (loopback tail)
         if let Some(until) = tx_cooldown_until {
@@ -2575,14 +2773,12 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
                 || result.mean_confidence >= 0.70
         } else {
             // ── Normal mode: two-arm threshold ────────────────────────────
-            // Arm 1: CCF≥100, conf≥0.45  (main gate, catches bulk of signals)
-            // Arm 2: CCF≥25,  conf≥0.75  (high-confidence short pings —
-            //        brief meteor trails with clean decode but low energy)
-            // Data: 24/26 real signals caught, 0.3:1 FP ratio on G4DCV/I5YDI burst
+            // Arm 1: main gate — CCF≥arm1_ccf + conf≥arm1_conf
+            // Arm 2: weak-ping fallback — lower CCF accepted when confidence is high
             let arm1 = ping.ccf_ratio >= settings.min_ccf
                 && result.mean_confidence >= settings.min_conf;
-            let arm2 = ping.ccf_ratio >= 25.0
-                && result.mean_confidence >= 0.70;
+            let arm2 = ping.ccf_ratio >= settings.arm2_ccf
+                && result.mean_confidence >= settings.arm2_conf;
             arm1 || arm2
         };
 
@@ -2658,6 +2854,8 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
             my_call: settings.my_call.clone(),
             df_bin_hz: None,
             passed_threshold: threshold_pass,
+            is_second_pass:   false,
+            second_pass_chars: vec![],
         }));
     }
 }
@@ -2681,7 +2879,7 @@ fn save_config(s: &Settings) {
         Period::TxSecond15 => "second15",
     };
     let data = format!(
-        "my_call={}\nmy_loc={}\ninput={}\noutput={}\nrig_model={}\nrig_port={}\nrig_baud={}\nhamlib_enabled={}\nperiod={}\ncty_path={}\nmax_km={}\nmin_ccf={}\nmin_conf={}\ntx_level={}\nant_bw_horiz={}\nant_bw_vert={}\n",
+        "my_call={}\nmy_loc={}\ninput={}\noutput={}\nrig_model={}\nrig_port={}\nrig_baud={}\nhamlib_enabled={}\nperiod={}\ncty_path={}\nmax_km={}\nmin_ccf={}\nmin_conf={}\ntx_level={}\nant_bw_horiz={}\nant_bw_vert={}\narm2_ccf={}\narm2_conf={}\nsave_max_data={}\n",
         s.my_call,
         s.my_loc,
         s.sel_in.as_deref().unwrap_or(""),
@@ -2698,6 +2896,9 @@ fn save_config(s: &Settings) {
         s.tx_level,
         s.ant_bw_horiz,
         s.ant_bw_vert,
+        s.arm2_ccf,
+        s.arm2_conf,
+        s.save_max_data,
     );
     if let Err(e) = std::fs::write(config_path(), data) {
         log::warn!("Failed to save config: {}", e);
@@ -2736,6 +2937,9 @@ fn load_config() -> Settings {
             "tx_level"       => s.tx_level  = v.parse().unwrap_or(0.8),
             "ant_bw_horiz"   => s.ant_bw_horiz = v.parse().unwrap_or(40.0),
             "ant_bw_vert"    => s.ant_bw_vert   = v.parse().unwrap_or(40.0),
+            "arm2_ccf"       => s.arm2_ccf      = v.parse().unwrap_or(40.0),
+            "arm2_conf"      => s.arm2_conf      = v.parse().unwrap_or(0.80),
+            "save_max_data"  => s.save_max_data  = v == "true",
             _ => {}
         }
     }
