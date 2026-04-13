@@ -175,10 +175,38 @@ jobs:
           chmod +x ${{ matrix.artifact }}
           tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
 
+      # ── Windows: download Hamlib, bundle rigctld + DLLs, zip ─────────────
+      - name: Download Hamlib (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          curl -L https://github.com/Hamlib/Hamlib/releases/download/4.5.5/hamlib-w64-4.5.5.zip -o hamlib.zip
+          Expand-Archive -Path hamlib.zip -DestinationPath hamlib
+
       - name: Package Windows
         if: runner.os == 'Windows'
         run: |
-          copy target\${{ matrix.target }}\release\fsk441.exe ${{ matrix.artifact }}.exe
+          # Create release directory layout
+          mkdir release
+          mkdir release\tools
+
+          # Main executable
+          copy target\${{ matrix.target }}\release\fsk441.exe release\fsk441.exe
+
+          # DLLs alongside exe (runtime deps loaded by fsk441.exe)
+          copy hamlib\hamlib-w64-4.5.5\bin\libhamlib-4.dll      release\
+          copy hamlib\hamlib-w64-4.5.5\bin\libgcc_s_sjlj-1.dll  release\
+          copy hamlib\hamlib-w64-4.5.5\bin\libusb-1.0.dll        release\
+          copy hamlib\hamlib-w64-4.5.5\bin\libwinpthread-1.dll   release\
+
+          # rigctld.exe + its own DLLs in tools\ (loaded relative to rigctld.exe)
+          copy hamlib\hamlib-w64-4.5.5\bin\rigctld.exe           release\tools\
+          copy hamlib\hamlib-w64-4.5.5\bin\libhamlib-4.dll       release\tools\
+          copy hamlib\hamlib-w64-4.5.5\bin\libgcc_s_sjlj-1.dll  release\tools\
+          copy hamlib\hamlib-w64-4.5.5\bin\libusb-1.0.dll        release\tools\
+          copy hamlib\hamlib-w64-4.5.5\bin\libwinpthread-1.dll   release\tools\
+
+          # Zip the whole release folder
+          Compress-Archive -Path release\* -DestinationPath ${{ matrix.artifact }}.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -187,7 +215,7 @@ jobs:
           path: |
             ${{ matrix.artifact }}.dmg
             ${{ matrix.artifact }}.tar.gz
-            ${{ matrix.artifact }}.exe
+            ${{ matrix.artifact }}.zip
           if-no-files-found: ignore
 
       - name: Upload to release
@@ -197,4 +225,4 @@ jobs:
           files: |
             ${{ matrix.artifact }}.dmg
             ${{ matrix.artifact }}.tar.gz
-            ${{ matrix.artifact }}.exe
+            ${{ matrix.artifact }}.zip

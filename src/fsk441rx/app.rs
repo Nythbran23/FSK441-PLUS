@@ -110,8 +110,46 @@ fn enumerate_audio_devices() -> (Vec<String>, Vec<String>) {
 
 fn enumerate_rigs() -> Vec<(String, String)> {
     let mut list = Vec::new();
-    // Try rigctld in PATH or bundled locations
-    for cmd in &["rigctld", "/usr/local/bin/rigctld", "/opt/homebrew/bin/rigctld"] {
+
+    // Build candidate paths — binary-adjacent first (works for bundled rigctld.exe),
+    // then well-known install locations on each platform.
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    // Next to our own executable (covers bundled rigctld / rigctld.exe)
+    // Also check tools/ subdirectory — matches MSK2K Windows release layout
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let name = if cfg!(windows) { "rigctld.exe" } else { "rigctld" };
+            candidates.push(dir.join(name));
+            candidates.push(dir.join("tools").join(name));
+        }
+    }
+
+    // Platform-specific well-known locations
+    if cfg!(windows) {
+        for p in &[
+            r"C:\Program Files\Hamlib\bin\rigctld.exe",
+            r"C:\Program Files (x86)\Hamlib\bin\rigctld.exe",
+            r"C:\hamlib\bin\rigctld.exe",
+            r"C:\tools\hamlib\bin\rigctld.exe",
+        ] {
+            candidates.push(std::path::PathBuf::from(p));
+        }
+        // Also try bare name in PATH
+        candidates.push(std::path::PathBuf::from("rigctld.exe"));
+        candidates.push(std::path::PathBuf::from("rigctld"));
+    } else {
+        for p in &[
+            "/usr/local/bin/rigctld",
+            "/opt/homebrew/bin/rigctld",
+            "/usr/bin/rigctld",
+        ] {
+            candidates.push(std::path::PathBuf::from(p));
+        }
+        candidates.push(std::path::PathBuf::from("rigctld"));
+    }
+
+    for cmd in &candidates {
         if let Ok(out) = Command::new(cmd).arg("-l").output() {
             if let Ok(text) = String::from_utf8(out.stdout) {
                 for line in text.lines() {
@@ -123,9 +161,16 @@ fn enumerate_rigs() -> Vec<(String, String)> {
                         list.push((id, name));
                     }
                 }
-                if !list.is_empty() { break; }
+                if !list.is_empty() {
+                    log::info!("[RIGS] Enumerated {} rigs from {:?}", list.len(), cmd);
+                    break;
+                }
             }
         }
+    }
+
+    if list.is_empty() {
+        log::warn!("[RIGS] rigctld not found — rig list empty. Install Hamlib or bundle rigctld.");
     }
     list
 }
@@ -158,8 +203,7 @@ pub struct DecodeEntry {
     my_call:        String,
     df_bin_hz:      Option<i32>,
     passed_threshold: bool,  // false = shown only in RAW mode  // set for accumulated rows — used to update in place
-    is_second_pass:   bool,  // true = second-pass recovery, rendered italic cyan
-    /// For second-pass rows: (char, energy, confirmed_above_floor)
+    is_second_pass:   bool,
     second_pass_chars: Vec<(char, bool)>,
 }
 
@@ -214,7 +258,7 @@ struct Settings {
     ant_bw_vert:    f32,   // antenna 3 dB vertical beamwidth (°)
     arm2_ccf:       f32,   // Arm 2 min CCF (weak high-conf pings)
     arm2_conf:      f32,   // Arm 2 min confidence
-    save_max_data:  bool,  // retain analysis_pings in DB for off-line analysis
+    save_max_data:  bool,  // retain analysis_pings in DB after scoring
 }
 
 impl Default for Settings {
@@ -450,12 +494,12 @@ struct Fsk441App {
     _rigctld:        Option<ProcessGuard>,
     settings_watch_tx: tokio::sync::watch::Sender<Settings>,
     qso_time_on:       Option<chrono::DateTime<chrono::Utc>>,
-    qso_logged:        bool,   // true after successful ADIF write — hides LOG button
+    qso_logged:        bool,
     adif_logger:       AdifLogger,
     adif_log:          Vec<QsoRecord>,
-    last_analysis:     Option<Box<ThresholdSuggestion>>,  // latest optimiser result
+    last_analysis:     Option<Box<ThresholdSuggestion>>,
     // Second-pass decoder
-    event_tx:            mpsc::UnboundedSender<EngineEvent>,  // kept for spawning second-pass
+    event_tx:            mpsc::UnboundedSender<EngineEvent>,
     second_pass_db_path: String,
 }
 
@@ -509,10 +553,37 @@ impl Fsk441App {
             let baud: u32 = settings.rig_baud.parse().unwrap_or(19200);
             log::info!("[LAUNCHER] Auto-starting rigctld: model={} port={} baud={}",
                 settings.rig_model, settings.rig_port, baud);
-            // Kill any stale instance before launching
-            let _ = Command::new("pkill").args(["-f", "rigctld"]).output();
+
+            // Kill any stale instance — platform-specific
+            if cfg!(windows) {
+                let _ = Command::new("taskkill").args(["/F", "/IM", "rigctld.exe"]).output();
+            } else {
+                let _ = Command::new("pkill").args(["-f", "rigctld"]).output();
+            }
             std::thread::sleep(std::time::Duration::from_millis(300));
-            match Command::new("rigctld")
+
+            // Find rigctld — tools/ subdir first (matches MSK2K bundling), then binary-adjacent, then PATH
+            let rigctld_cmd = {
+                let name = if cfg!(windows) { "rigctld.exe" } else { "rigctld" };
+                let found = std::env::current_exe().ok()
+                    .and_then(|e| e.parent().map(|d| d.to_path_buf()))
+                    .and_then(|dir| {
+                        let tools = dir.join("tools").join(name);
+                        if tools.exists() { return Some(tools); }
+                        let adj = dir.join(name);
+                        if adj.exists() { return Some(adj); }
+                        None
+                    });
+                if let Some(p) = found {
+                    p.to_string_lossy().to_string()
+                } else if cfg!(windows) {
+                    "rigctld.exe".to_string()
+                } else {
+                    "rigctld".to_string()
+                }
+            };
+
+            match Command::new(&rigctld_cmd)
                 .args(["-m", &settings.rig_model,
                        "-r", &settings.rig_port,
                        "-s", &baud.to_string(),
@@ -523,7 +594,7 @@ impl Fsk441App {
                     log::info!("[LAUNCHER] rigctld started (pid={})", c.id());
                     rigctld_guard = Some(ProcessGuard(c));
                 }
-                Err(e) => log::error!("[LAUNCHER] rigctld failed: {}", e),
+                Err(e) => log::error!("[LAUNCHER] rigctld failed ({}): {}", rigctld_cmd, e),
             }
             // Give rigctld time to bind port 4532
             std::thread::sleep(std::time::Duration::from_millis(800));
@@ -597,7 +668,7 @@ impl Fsk441App {
                         my_call: self.settings.my_call.clone(),
                         df_bin_hz: Some(acc.df_bin_hz),
                         passed_threshold: true,
-                        is_second_pass:   false,
+                        is_second_pass: false,
                         second_pass_chars: vec![],
                     };
                     // Update seen callsigns — exclude MYCALL
@@ -643,7 +714,6 @@ impl Fsk441App {
                     continue;
                 }
                 EngineEvent::AnalysisSaved(capture_id, n) => {
-                    // Auto-save just completed — spawn second-pass immediately during TX.
                     log::info!("[UI] Analysis saved: capture={} n={} — spawning second pass", capture_id, n);
                     let my_call = self.settings.my_call.trim().to_uppercase();
                     let their_call = self.settings.their_call_hint.clone();
@@ -690,48 +760,28 @@ impl Fsk441App {
                 EngineEvent::SecondPassDecodes(results) => {
                     log::info!("[UI] Second-pass: {} recoveries", results.len());
                     for r in results {
-                        // Parse detected_at timestamp for chronological insertion
                         let ts = chrono::DateTime::parse_from_rfc3339(&r.detected_at)
                             .map(|dt| dt.with_timezone(&chrono::Utc))
                             .unwrap_or_else(|_| chrono::Utc::now());
-
-                        // Build per-char confirmed map from hypothesis
                         let hyp_chars: Vec<char> = r.hypothesis.chars().collect();
                         let mut second_pass_chars: Vec<(char, bool)> = Vec::new();
                         let mut conf_iter = r.confirmed_chars.iter().peekable();
                         for &hc in &hyp_chars {
                             let confirmed = if let Some((cc, _)) = conf_iter.peek() {
                                 if *cc == hc.to_ascii_uppercase() {
-                                    conf_iter.next();
-                                    true
+                                    conf_iter.next(); true
                                 } else { false }
                             } else { false };
                             second_pass_chars.push((hc, confirmed));
                         }
-
                         let entry = DecodeEntry {
-                            timestamp:   ts,
-                            df_hz:       r.df_hz,
-                            ccf_ratio:   r.ccf_ratio,
-                            duration_ms: 0.0,
-                            confidence:  r.mean_confidence,
-                            score:       0,
-                            raw:         r.hypothesis.clone(),
-                            callsigns:   vec![],
-                            locator:     None,
-                            report:      None,
-                            is_cq:       false,
-                            char_confs:  vec![],
-                            is_accumulated: false,
-                            my_call:     String::new(),
-                            df_bin_hz:   None,
-                            passed_threshold: true,
-                            is_second_pass:   true,
-                            second_pass_chars,
+                            timestamp: ts, df_hz: r.df_hz, ccf_ratio: r.ccf_ratio,
+                            duration_ms: 0.0, confidence: r.mean_confidence, score: 0,
+                            raw: r.hypothesis.clone(), callsigns: vec![], locator: None,
+                            report: None, is_cq: false, char_confs: vec![],
+                            is_accumulated: false, my_call: String::new(), df_bin_hz: None,
+                            passed_threshold: true, is_second_pass: true, second_pass_chars,
                         };
-
-                        // Insert chronologically so second-pass rows appear
-                        // at the timestamp of the original ping, not when scored
                         let pos = self.decodes.partition_point(|d| d.timestamp <= ts);
                         self.decodes.insert(pos, entry);
                     }
@@ -2015,10 +2065,7 @@ impl eframe::App for Fsk441App {
                 ui.label(egui::RichText::new("Decoded Pings").strong()
                     .color(egui::Color32::from_rgb(180, 200, 255)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Clear").clicked() {
-                        self.clear_decodes();
-                    }
-                    ui.separator();
+
                     // Max Data toggle — auto-saves ring buffer at every TX start
                     let max_col = if self.settings.save_max_data {
                         egui::Color32::from_rgb(80, 200, 220)
@@ -2037,6 +2084,10 @@ impl eframe::App for Fsk441App {
                         self.settings.save_max_data = !self.settings.save_max_data;
                         save_config(&self.settings);
                     }
+                    ui.separator();
+                    if ui.button("Clear").clicked() {
+                        self.clear_decodes();
+                    }
                 });
             });
             ui.separator();
@@ -2053,49 +2104,6 @@ impl eframe::App for Fsk441App {
                     for i in 0..self.decodes.len() {
                         let e   = &self.decodes[i];
                         if e.is_accumulated { continue; } // shown in QSO panel
-
-                        // ── Second-pass recovery row ──────────────────────────
-                        if e.is_second_pass {
-                            let header = format!("{:<10} {:>+7.0}          ",
-                                e.timestamp.format("%H:%M:%S"), e.df_hz);
-                            let their_hint = self.settings.their_call_hint.clone();
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 0.0;
-                                // Dim header
-                                ui.label(egui::RichText::new(&header)
-                                    .monospace().italics()
-                                    .color(egui::Color32::from_gray(140)));
-                                // ⟳ prefix
-                                ui.label(egui::RichText::new("⟳ ")
-                                    .monospace().italics()
-                                    .color(egui::Color32::from_rgb(80, 200, 220)));
-                                // Hypothesis chars — confirmed in cyan brackets, rest dim italic
-                                for &(hc, confirmed) in &e.second_pass_chars {
-                                    let highlight = their_hint.as_deref()
-                                        .map(|h| h.contains(hc.to_ascii_uppercase()))
-                                        .unwrap_or(false);
-                                    if confirmed {
-                                        let col = if highlight {
-                                            egui::Color32::from_rgb(80, 255, 160)
-                                        } else {
-                                            egui::Color32::from_rgb(80, 200, 220)
-                                        };
-                                        ui.label(egui::RichText::new(format!("[{}]", hc))
-                                            .monospace().italics().strong().color(col));
-                                    } else {
-                                        ui.label(egui::RichText::new(hc.to_string())
-                                            .monospace().italics()
-                                            .color(egui::Color32::from_gray(110)));
-                                    }
-                                }
-                                // Confidence annotation
-                                ui.label(egui::RichText::new(
-                                    format!("  {:.2}", e.confidence))
-                                    .color(egui::Color32::from_gray(120)));
-                            });
-                            continue;
-                        }
-
                         let sel = self.selected == Some(i);
                         let _e_passed = e.passed_threshold;
                         let _e_accum  = e.is_accumulated;
@@ -2216,33 +2224,35 @@ impl eframe::App for Fsk441App {
                             }
                         });
 
-                        // Handle row click — second click deselects, click elsewhere deselects
-                        if (resp.clicked() || resp.secondary_clicked()) && !in_qso {
+                        // Handle row click — second click deselects, click elsewhere deselects.
+                        // Deselection works regardless of QSO state.
+                        // Auto-population of their call only happens when not locked.
+                        if resp.clicked() || resp.secondary_clicked() {
                             if self.selected == Some(i) {
                                 self.selected = None;
                                 continue;
                             }
                             self.selected = Some(i);
-                            let my = self.settings.my_call.to_uppercase();
-                            let foreign: Vec<&String> = e.callsigns.iter()
-                                .filter(|c| !c.eq_ignore_ascii_case(&my))
-                                .collect();
-                            // Only auto-populate if exactly one foreign call — otherwise
-                            // user must click the individual callsign button below
-                            if foreign.len() == 1 {
-                                self.their_call_edit = foreign[0].clone();
-                                self.tx_msgs_key.clear();
-                            } else if foreign.is_empty() {
-                                if let Some(c) = e.callsigns.first() {
-                                    self.their_call_edit = c.clone();
+                            // Only auto-populate call/loc/report when not locked
+                            if !in_qso {
+                                let my = self.settings.my_call.to_uppercase();
+                                let foreign: Vec<&String> = e.callsigns.iter()
+                                    .filter(|c| !c.eq_ignore_ascii_case(&my))
+                                    .collect();
+                                if foreign.len() == 1 {
+                                    self.their_call_edit = foreign[0].clone();
                                     self.tx_msgs_key.clear();
+                                } else if foreign.is_empty() {
+                                    if let Some(c) = e.callsigns.first() {
+                                        self.their_call_edit = c.clone();
+                                        self.tx_msgs_key.clear();
+                                    }
                                 }
-                            }
-                            if let Some(loc) = &e.locator { self.their_loc_edit = loc.clone(); }
-                            if let Some(rpt) = &e.report  {
-                                // Strip R prefix (e.g. "R28" → "28")
-                                let clean = rpt.trim_start_matches('R').trim_start_matches('r').to_string();
-                                self.report_rcvd = clean;
+                                if let Some(loc) = &e.locator { self.their_loc_edit = loc.clone(); }
+                                if let Some(rpt) = &e.report  {
+                                    let clean = rpt.trim_start_matches('R').trim_start_matches('r').to_string();
+                                    self.report_rcvd = clean;
+                                }
                             }
                         }
 
@@ -2854,7 +2864,7 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
             my_call: settings.my_call.clone(),
             df_bin_hz: None,
             passed_threshold: threshold_pass,
-            is_second_pass:   false,
+            is_second_pass: false,
             second_pass_chars: vec![],
         }));
     }
