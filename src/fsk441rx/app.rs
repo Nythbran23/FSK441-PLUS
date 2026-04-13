@@ -2642,7 +2642,17 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
     let mut tx_cooldown_until: Option<std::time::Instant> = None;
     let mut was_transmitting = false;
 
-    while let Some(ping) = ping_rx.recv().await {
+    loop {
+        // Use a timeout so the loop wakes during TX even when no pings arrive.
+        // During RX the ping channel fires constantly so the timeout rarely hits.
+        let ping_opt = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            ping_rx.recv()
+        ).await;
+
+        // Channel closed — engine should exit
+        if let Ok(None) = ping_opt { break; }
+
         let is_tx = tx_active.load(std::sync::atomic::Ordering::Relaxed);
 
         // Background threshold optimiser — every 30 minutes
@@ -2695,7 +2705,7 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
         // Drain any pings that queued during TX — they are our own audio.
         // On the first TX frame, auto-save the ring buffer for second-pass scoring.
         if is_tx {
-            // Auto-save ring buffer on TX→RX transition detection (first is_tx frame)
+            // Auto-save ring buffer on first TX frame (was_transmitting transition)
             if !was_transmitting {
                 if let Some(ref s) = store {
                     let entries: Vec<AnalysisPing> = analysis_ring.iter().cloned().collect();
@@ -2712,8 +2722,7 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
                 }
             }
             was_transmitting = true;
-            frag_acc.prune_older_than(300); // housekeeping during TX
-            // Set cooldown so we reject ring-buffer bleed after TX ends
+            frag_acc.prune_older_than(300);
             tx_cooldown_until = Some(std::time::Instant::now()
                 + std::time::Duration::from_millis(1500));
             frag_acc.clear();
@@ -2721,6 +2730,12 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
             continue;
         }
         was_transmitting = false;
+
+        // If this iteration was a timeout (no ping), nothing more to do
+        let ping = match ping_opt {
+            Ok(Some(p)) => p,
+            _ => continue,
+        };
 
         // Reject pings during cooldown after TX (loopback tail)
         if let Some(until) = tx_cooldown_until {
