@@ -71,7 +71,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Build
-        run: cargo build --bin fsk441 --release --target ${{ matrix.target }}
+        run: cargo build --bin fsk441plus --release --target ${{ matrix.target }}
 
       # ── macOS: bundle, sign and notarize ─────────────────────────────────
       - name: Import signing certificate
@@ -96,7 +96,7 @@ jobs:
           APP="FSK441Plus.app"
           mkdir -p "$APP/Contents/MacOS"
           mkdir -p "$APP/Contents/Resources"
-          cp target/${{ matrix.target }}/release/fsk441 "$APP/Contents/MacOS/fsk441"
+          cp target/${{ matrix.target }}/release/fsk441plus "$APP/Contents/MacOS/fsk441plus"
           # Copy icon if present
           if [ -f assets/FSK441PLUS.png ]; then
             # Convert PNG to ICNS for proper macOS icon
@@ -123,7 +123,7 @@ jobs:
             <key>CFBundleIdentifier</key><string>com.thedxshop.fsk441plus</string>
             <key>CFBundleVersion</key><string>0.1.0</string>
             <key>CFBundleShortVersionString</key><string>0.1.0</string>
-            <key>CFBundleExecutable</key><string>fsk441</string>
+            <key>CFBundleExecutable</key><string>fsk441plus</string>
             <key>CFBundleIconFile</key><string>AppIcon</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>LSMinimumSystemVersion</key><string>12.0</string>
@@ -171,7 +171,7 @@ jobs:
       - name: Package Linux
         if: runner.os == 'Linux'
         run: |
-          cp target/${{ matrix.target }}/release/fsk441 ${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/fsk441plus ${{ matrix.artifact }}
           chmod +x ${{ matrix.artifact }}
           tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
 
@@ -190,7 +190,7 @@ jobs:
           mkdir release\tools
 
           # Main executable
-          copy target\${{ matrix.target }}\release\fsk441.exe release\fsk441.exe
+          copy target\${{ matrix.target }}\release\fsk441plus.exe release\fsk441plus.exe
 
           # DLLs alongside exe (runtime deps loaded by fsk441.exe)
           copy hamlib\hamlib-w64-4.5.5\bin\libhamlib-4.dll      release\

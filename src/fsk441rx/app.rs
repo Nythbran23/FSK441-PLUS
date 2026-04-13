@@ -635,6 +635,60 @@ impl Fsk441App {
         }
     }
 
+    fn launch_rigctld(&self) -> Option<ProcessGuard> {
+        // Kill any existing instance first — platform-specific
+        if cfg!(windows) {
+            let _ = Command::new("taskkill").args(["/F", "/IM", "rigctld.exe"]).output();
+        } else {
+            let _ = Command::new("pkill").args(["-f", "rigctld"]).output();
+        }
+
+        if !self.settings.hamlib_enabled
+            || self.settings.rig_model.is_empty()
+            || self.settings.rig_port.is_empty()
+        {
+            log::info!("[LAUNCHER] Hamlib disabled or incomplete settings — rigctld not started");
+            return None;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let baud: u32 = self.settings.rig_baud.parse().unwrap_or(19200);
+        let name = if cfg!(windows) { "rigctld.exe" } else { "rigctld" };
+        let rigctld_cmd = std::env::current_exe().ok()
+            .and_then(|e| e.parent().map(|d| d.to_path_buf()))
+            .and_then(|dir| {
+                let tools = dir.join("tools").join(name);
+                if tools.exists() { return Some(tools); }
+                let adj = dir.join(name);
+                if adj.exists() { return Some(adj); }
+                None
+            })
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| if cfg!(windows) { "rigctld.exe" } else { "rigctld" }.to_string());
+
+        log::info!("[LAUNCHER] Starting rigctld: {} model={} port={} baud={}",
+            rigctld_cmd, self.settings.rig_model, self.settings.rig_port, baud);
+
+        match Command::new(&rigctld_cmd)
+            .args(["-m", &self.settings.rig_model,
+                   "-r", &self.settings.rig_port,
+                   "-s", &baud.to_string(),
+                   "-P", "RIG"])
+            .spawn()
+        {
+            Ok(c) => {
+                log::info!("[LAUNCHER] rigctld started (pid={})", c.id());
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                Some(ProcessGuard(c))
+            }
+            Err(e) => {
+                log::error!("[LAUNCHER] rigctld failed ({}): {}", rigctld_cmd, e);
+                None
+            }
+        }
+    }
+
     fn refresh_audio_devices(&mut self) {
         let (i, o) = enumerate_audio_devices();
         if let Some(ref sel) = self.settings.sel_in.clone() {
@@ -2517,11 +2571,8 @@ impl eframe::App for Fsk441App {
                         self.period_timer = PeriodTimer::new(self.settings.period);
                         let _ = self.tx_cmd_tx.send(TxCommand::SetOutputDevice(self.settings.audio_out()));
                         let _ = self.tx_cmd_tx.send(TxCommand::SetHamlib(self.settings.hamlib_addr()));
-                        // Kill existing rigctld if hamlib disabled
-                        if !self.settings.hamlib_enabled {
-                            std::process::Command::new("pkill").args(["-f", "rigctld"]).spawn().ok();
-                            log::info!("[LAUNCHER] Hamlib disabled — killed rigctld");
-                        }
+                        // Restart rigctld with new settings (covers port/baud/model changes)
+                        self._rigctld = self.launch_rigctld();
                     }
                 });
         }
@@ -2642,17 +2693,7 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
     let mut tx_cooldown_until: Option<std::time::Instant> = None;
     let mut was_transmitting = false;
 
-    loop {
-        // Use a timeout so the loop wakes during TX even when no pings arrive.
-        // During RX the ping channel fires constantly so the timeout rarely hits.
-        let ping_opt = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            ping_rx.recv()
-        ).await;
-
-        // Channel closed — engine should exit
-        if let Ok(None) = ping_opt { break; }
-
+    while let Some(ping) = ping_rx.recv().await {
         let is_tx = tx_active.load(std::sync::atomic::Ordering::Relaxed);
 
         // Background threshold optimiser — every 30 minutes
@@ -2705,7 +2746,7 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
         // Drain any pings that queued during TX — they are our own audio.
         // On the first TX frame, auto-save the ring buffer for second-pass scoring.
         if is_tx {
-            // Auto-save ring buffer on first TX frame (was_transmitting transition)
+            // Auto-save ring buffer on TX→RX transition detection (first is_tx frame)
             if !was_transmitting {
                 if let Some(ref s) = store {
                     let entries: Vec<AnalysisPing> = analysis_ring.iter().cloned().collect();
@@ -2722,7 +2763,8 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
                 }
             }
             was_transmitting = true;
-            frag_acc.prune_older_than(300);
+            frag_acc.prune_older_than(300); // housekeeping during TX
+            // Set cooldown so we reject ring-buffer bleed after TX ends
             tx_cooldown_until = Some(std::time::Instant::now()
                 + std::time::Duration::from_millis(1500));
             frag_acc.clear();
@@ -2730,12 +2772,6 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
             continue;
         }
         was_transmitting = false;
-
-        // If this iteration was a timeout (no ping), nothing more to do
-        let ping = match ping_opt {
-            Ok(Some(p)) => p,
-            _ => continue,
-        };
 
         // Reject pings during cooldown after TX (loopback tail)
         if let Some(until) = tx_cooldown_until {
@@ -2987,7 +3023,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native("FSK441 PLUS",
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_inner_size([1100.0, 700.0])
+                .with_inner_size([1100.0, 1000.0])
                 .with_min_inner_size([800.0, 520.0]),
             ..Default::default()
         },
