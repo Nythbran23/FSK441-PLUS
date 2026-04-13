@@ -34,7 +34,7 @@ use store::{Store, AnalysisPing};
 use adif::{AdifLogger, QsoRecord};
 use analysis::ThresholdSuggestion;
 use geo::{GeoValidator, PrefixDb, Qth};
-use tx::{TxCommand, PeriodTimer, Period, SlotState, HamlibUpdate};
+use tx::{TxCommand, PttMethod, PeriodTimer, Period, SlotState, HamlibUpdate};
 use spectrum::{compute_column, heat_color, FSK441_TONES_HZ, DISPLAY_BINS, hz_to_bin};
 use accumulator::{FragmentAccumulator, Fragment, AccumulatedDecode};
 use qso::{QsoState, on_decode, Transition};
@@ -263,6 +263,8 @@ struct Settings {
     arm2_ccf:       f32,   // Arm 2 min CCF (weak high-conf pings)
     arm2_conf:      f32,   // Arm 2 min confidence
     save_max_data:  bool,  // retain analysis_pings in DB after scoring
+    ptt_method:     PttMethod,
+    ptt_port:       String,  // serial port for RTS/DTR PTT (empty = not set)
 }
 
 impl Default for Settings {
@@ -287,12 +289,14 @@ impl Default for Settings {
             min_conf:       0.45,
             clear_accumulator: false,
             their_df_hz: None,
-            tx_level:       0.8,
+            tx_level:       0.1,
             ant_bw_horiz:   40.0,
             ant_bw_vert:    40.0,
             arm2_ccf:       40.0,
             arm2_conf:      0.80,
             save_max_data:  false,
+            ptt_method:     PttMethod::CatHamlib,
+            ptt_port:       String::new(),
         }
     }
 }
@@ -481,6 +485,7 @@ struct Fsk441App {
     wf_columns:      Vec<Vec<f32>>,
     df_dots:         Vec<DfDot>,   // DF scatter strip history
     wf_amplitude:    Vec<f32>,  // RMS amplitude per column (0..1)
+    audio_rms:       f32,       // latest RMS for input level indicator
     wf_period_idx:   i64,  // slot index when columns last cleared
     tx_msgs_key:     String,       // last key used to populate — repopulate only on change
     qso_log:         Vec<String>,
@@ -654,6 +659,7 @@ impl Fsk441App {
             } else { None }
         },
         wf_amplitude: Vec::new(),
+        audio_rms: 0.0,
         wf_period_idx: -1,
         tx_msgs: Default::default(), tx_msgs_key: String::new(), qso_log: Vec::new(), seen_calls: Vec::new(), station_tracker: StationTracker::default(), qso_summary: None, settings_watch_tx, recalibrate_tx, rig_freq_hz: None,
             base_freq_hz: None,
@@ -904,6 +910,7 @@ impl Fsk441App {
                     }
                     self.wf_columns.push(bins);
                     self.wf_amplitude.push(rms);
+                    self.audio_rms = rms;
                     continue;
                 }
                 EngineEvent::Hamlib(upd) => {
@@ -1438,6 +1445,57 @@ impl eframe::App for Fsk441App {
                         self.settings_open = !self.settings_open;
                         if self.settings_open { self.refresh_audio_devices(); }
                     }
+                    ui.separator();
+
+                    // Audio input level indicator — colour-coded bargraph
+                    // RMS thresholds: <0.01 = silent/too low, 0.01-0.5 = good, >0.5 = hot
+                    let rms = self.audio_rms;
+                    let (bar_col, label_col, tip) = if rms < 0.01 {
+                        (egui::Color32::from_rgb(100, 100, 100),
+                         egui::Color32::from_rgb(160, 160, 160),
+                         "Input level too low — check audio source")
+                    } else if rms > 0.5 {
+                        (egui::Color32::from_rgb(220, 60, 60),
+                         egui::Color32::from_rgb(255, 100, 100),
+                         "Input level too high — risk of clipping. Reduce rig USB output or audio card gain")
+                    } else if rms > 0.3 {
+                        (egui::Color32::from_rgb(220, 180, 40),
+                         egui::Color32::from_rgb(240, 200, 60),
+                         "Input level high but usable")
+                    } else {
+                        (egui::Color32::from_rgb(40, 200, 100),
+                         egui::Color32::from_gray(200),
+                         "Input level good")
+                    };
+
+                    ui.label(egui::RichText::new("RX")
+                        .color(label_col).small())
+                        .on_hover_text(tip);
+
+                    // 8-segment bargraph
+                    let bar_resp = ui.allocate_response(
+                        egui::vec2(48.0, 12.0), egui::Sense::hover());
+                    let rect = bar_resp.rect;
+                    let painter = ui.painter();
+                    let segments = 8usize;
+                    let filled = ((rms / 0.6).min(1.0) * segments as f32).ceil() as usize;
+                    let seg_w = rect.width() / segments as f32 - 1.0;
+                    for i in 0..segments {
+                        let x = rect.left() + i as f32 * (seg_w + 1.0);
+                        let seg_rect = egui::Rect::from_min_size(
+                            egui::pos2(x, rect.top()),
+                            egui::vec2(seg_w, rect.height()),
+                        );
+                        let col = if i < filled {
+                            if i >= 6 { egui::Color32::from_rgb(220, 60, 60) }
+                            else if i >= 5 { egui::Color32::from_rgb(220, 180, 40) }
+                            else { bar_col }
+                        } else {
+                            egui::Color32::from_gray(40)
+                        };
+                        painter.rect_filled(seg_rect, 1.0, col);
+                    }
+                    bar_resp.on_hover_text(tip);
                 });
             });
         });
@@ -2501,6 +2559,54 @@ impl eframe::App for Fsk441App {
                         });
                     }
 
+                    // ── PTT Method ────────────────────────────────────────
+                    ui.separator();
+                    ui.heading("PTT");
+                    egui::Grid::new("ptt_grid")
+                        .num_columns(2).spacing([10.0, 8.0])
+                        .show(ui, |ui| {
+                        ui.label("PTT Method:");
+                        egui::ComboBox::from_id_salt("ptt_method")
+                            .selected_text(self.settings.ptt_method.label())
+                            .width(180.0)
+                            .show_ui(ui, |ui| {
+                                for method in &[PttMethod::CatHamlib, PttMethod::RtsPort,
+                                               PttMethod::DtrPort, PttMethod::Vox] {
+                                    ui.selectable_value(
+                                        &mut self.settings.ptt_method,
+                                        method.clone(), method.label());
+                                }
+                            });
+                        ui.end_row();
+
+                        // PTT port only shown for RTS/DTR
+                        if self.settings.ptt_method == PttMethod::RtsPort
+                            || self.settings.ptt_method == PttMethod::DtrPort
+                        {
+                            ui.label("PTT Port:");
+                            ui.horizontal(|ui| {
+                                let port_disp = if self.settings.ptt_port.is_empty() {
+                                    "Select Port...".to_string()
+                                } else {
+                                    self.settings.ptt_port.clone()
+                                };
+                                egui::ComboBox::from_id_salt("ptt_port")
+                                    .selected_text(&port_disp).width(200.0)
+                                    .show_ui(ui, |ui| {
+                                        for p in &self.serial_ports.clone() {
+                                            ui.selectable_value(
+                                                &mut self.settings.ptt_port,
+                                                p.clone(), p);
+                                        }
+                                    });
+                                if ui.button("🔄").clicked() {
+                                    self.serial_ports = enumerate_serial_ports();
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+
                     // ── Audio Hardware ────────────────────────────────────
                     ui.separator();
                     ui.heading("Audio Hardware");
@@ -2656,6 +2762,11 @@ impl eframe::App for Fsk441App {
                         self.period_timer = PeriodTimer::new(self.settings.period);
                         let _ = self.tx_cmd_tx.send(TxCommand::SetOutputDevice(self.settings.audio_out()));
                         let _ = self.tx_cmd_tx.send(TxCommand::SetHamlib(self.settings.hamlib_addr()));
+                        let _ = self.tx_cmd_tx.send(TxCommand::SetPttMethod(
+                            self.settings.ptt_method.clone(),
+                            if self.settings.ptt_port.is_empty() { None }
+                            else { Some(self.settings.ptt_port.clone()) }
+                        ));
                         // Restart rigctld with new settings (covers port/baud/model changes)
                         self._rigctld = self.launch_rigctld();
                     }
@@ -3062,7 +3173,7 @@ fn save_config(s: &Settings) {
         Period::TxSecond15 => "second15",
     };
     let data = format!(
-        "my_call={}\nmy_loc={}\ninput={}\noutput={}\nrig_model={}\nrig_port={}\nrig_baud={}\nhamlib_enabled={}\nperiod={}\ncty_path={}\nmax_km={}\nmin_ccf={}\nmin_conf={}\ntx_level={}\nant_bw_horiz={}\nant_bw_vert={}\narm2_ccf={}\narm2_conf={}\nsave_max_data={}\n",
+        "my_call={}\nmy_loc={}\ninput={}\noutput={}\nrig_model={}\nrig_port={}\nrig_baud={}\nhamlib_enabled={}\nperiod={}\ncty_path={}\nmax_km={}\nmin_ccf={}\nmin_conf={}\ntx_level={}\nant_bw_horiz={}\nant_bw_vert={}\narm2_ccf={}\narm2_conf={}\nsave_max_data={}\nptt_method={}\nptt_port={}\n",
         s.my_call,
         s.my_loc,
         s.sel_in.as_deref().unwrap_or(""),
@@ -3082,6 +3193,8 @@ fn save_config(s: &Settings) {
         s.arm2_ccf,
         s.arm2_conf,
         s.save_max_data,
+        s.ptt_method.to_str(),
+        s.ptt_port,
     );
     if let Err(e) = std::fs::write(config_path(), data) {
         log::warn!("Failed to save config: {}", e);
@@ -3123,6 +3236,8 @@ fn load_config() -> Settings {
             "arm2_ccf"       => s.arm2_ccf      = v.parse().unwrap_or(40.0),
             "arm2_conf"      => s.arm2_conf      = v.parse().unwrap_or(0.80),
             "save_max_data"  => s.save_max_data  = v == "true",
+            "ptt_method"     => s.ptt_method     = PttMethod::from_str(v),
+            "ptt_port"       => s.ptt_port        = v.to_string(),
             _ => {}
         }
     }

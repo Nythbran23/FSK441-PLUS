@@ -113,6 +113,32 @@ fn find_output_device(display_name: &str) -> Option<cpal::Device> {
 
 // ─── Audio playback — uses msk2k_audio AudioOutputBuilder ────────────────────
 
+/// Toggle RTS or DTR line on a serial port for hardware PTT
+fn set_serial_ptt(port_name: &str, method: &PttMethod, active: bool) {
+    use serialport::SerialPort;
+    match serialport::new(port_name, 9600)
+        .timeout(std::time::Duration::from_millis(100))
+        .open()
+    {
+        Ok(mut port) => {
+            let result = match method {
+                PttMethod::RtsPort => port.write_request_to_send(active),
+                PttMethod::DtrPort => port.write_data_terminal_ready(active),
+                _ => Ok(()),
+            };
+            if let Err(e) = result {
+                log::error!("[PTT] Serial PTT error on {}: {}", port_name, e);
+            } else {
+                log::info!("[PTT] Serial PTT {} on {} ({})",
+                    if active { "ON" } else { "OFF" },
+                    port_name,
+                    match method { PttMethod::RtsPort => "RTS", _ => "DTR" });
+            }
+        }
+        Err(e) => log::error!("[PTT] Cannot open serial port {}: {}", port_name, e),
+    }
+}
+
 fn play_audio_blocking(samples: Vec<f32>, device_name: Option<String>, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     #[allow(unused_imports)]
 
@@ -229,6 +255,41 @@ impl PeriodTimer {
 
 // ─── TX commands ─────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum PttMethod {
+    CatHamlib,
+    RtsPort,
+    DtrPort,
+    Vox,
+}
+
+impl PttMethod {
+    pub fn label(&self) -> &str {
+        match self {
+            PttMethod::CatHamlib => "CAT (Hamlib)",
+            PttMethod::RtsPort   => "RTS (Serial)",
+            PttMethod::DtrPort   => "DTR (Serial)",
+            PttMethod::Vox       => "VOX",
+        }
+    }
+    pub fn to_str(&self) -> &str {
+        match self {
+            PttMethod::CatHamlib => "cat",
+            PttMethod::RtsPort   => "rts",
+            PttMethod::DtrPort   => "dtr",
+            PttMethod::Vox       => "vox",
+        }
+    }
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "rts" => PttMethod::RtsPort,
+            "dtr" => PttMethod::DtrPort,
+            "vox" => PttMethod::Vox,
+            _     => PttMethod::CatHamlib,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum TxCommand {
     Transmit      { message: String, output_device: Option<String> },
@@ -238,9 +299,10 @@ pub enum TxCommand {
     SetPeriod     (Period),
     SetOutputDevice(Option<String>),
     SetHamlib     (Option<String>),
+    SetPttMethod  (PttMethod, Option<String>),  // method + optional port
     #[allow(dead_code)]
     ClearAccumulator,
-    SetFreq       (u64),               // QSY rig to frequency in Hz                  // reset soft-bit accumulator between QSOs
+    SetFreq       (u64),
 }
 
 // ─── Hamlib client — full port of MSK2K src/engine/hamlib.rs ─────────────────
@@ -368,6 +430,8 @@ pub struct TxEngine {
     pub output_device:     Option<String>,
     pub hamlib_addr:       Option<String>,
     pub hamlib_update_tx:  mpsc::UnboundedSender<HamlibUpdate>,
+    pub ptt_method:        PttMethod,
+    pub ptt_port:          Option<String>,
 }
 
 impl TxEngine {
@@ -377,7 +441,8 @@ impl TxEngine {
         output_device:    Option<String>,
         hamlib_addr:      Option<String>,
         hamlib_update_tx: mpsc::UnboundedSender<HamlibUpdate>,
-    ) -> Self { Self { cmd_rx, period, output_device, hamlib_addr, hamlib_update_tx } }
+    ) -> Self { Self { cmd_rx, period, output_device, hamlib_addr, hamlib_update_tx,
+        ptt_method: PttMethod::CatHamlib, ptt_port: None } }
 
     pub async fn run(mut self) {
         let mut tx_par: u8 = match self.period {
@@ -430,6 +495,11 @@ impl TxEngine {
                         log::info!("[TX] Hamlib {}", if addr.is_some() { "enabled" } else { "disabled" });
                         self.hamlib_addr = addr;
                         hamlib_enabled = self.hamlib_addr.is_some();
+                    }
+                    TxCommand::SetPttMethod(method, port) => {
+                        log::info!("[TX] PTT method changed to {:?} port={:?}", method, port);
+                        self.ptt_method = method;
+                        self.ptt_port   = port;
                     }
                     // Immediate commands — no slot boundary needed
                     TxCommand::SetFreq(hz) => {
@@ -512,6 +582,7 @@ impl TxEngine {
                 Some(TxCommand::SetPeriod(_))
                 | Some(TxCommand::SetOutputDevice(_))
                 | Some(TxCommand::SetHamlib(_))
+                | Some(TxCommand::SetPttMethod(_, _))
                 | Some(TxCommand::ClearAccumulator)
                 | Some(TxCommand::SetFreq(_)) => {
                     current = None;
@@ -556,18 +627,38 @@ impl TxEngine {
                 repeats, msg_len * 1000 / SAMPLE_RATE as usize);
 
             // PTT on
-            if hamlib_enabled { if let Some(ref h) = hamlib { h.set_ptt(true); } }
+            match &self.ptt_method {
+                PttMethod::CatHamlib => {
+                    if hamlib_enabled { if let Some(ref h) = hamlib { h.set_ptt(true); } }
+                }
+                PttMethod::RtsPort | PttMethod::DtrPort => {
+                    if let Some(ref port) = self.ptt_port {
+                        set_serial_ptt(port, &self.ptt_method, true);
+                    }
+                }
+                PttMethod::Vox => {} // VOX — audio output triggers PTT
+            }
             let _ = self.hamlib_update_tx.send(HamlibUpdate { freq: None, connected: None, transmitting: true });
 
-            // Play audio — MSK2K pattern: sleep(duration+500) then drop stream
+            // Play audio
             let device = dev.or_else(|| self.output_device.clone());
             let cancel_clone = cancel_flag.clone();
             tokio::task::spawn_blocking(move || {
                 play_audio_blocking(waveform, device, cancel_clone);
             }).await.ok();
 
-            // PTT off — fires immediately after audio+500ms, stream already closed
-            if hamlib_enabled { if let Some(ref h) = hamlib { h.set_ptt(false); } }
+            // PTT off
+            match &self.ptt_method {
+                PttMethod::CatHamlib => {
+                    if hamlib_enabled { if let Some(ref h) = hamlib { h.set_ptt(false); } }
+                }
+                PttMethod::RtsPort | PttMethod::DtrPort => {
+                    if let Some(ref port) = self.ptt_port {
+                        set_serial_ptt(port, &self.ptt_method, false);
+                    }
+                }
+                PttMethod::Vox => {}
+            }
             let _ = self.hamlib_update_tx.send(HamlibUpdate { freq: None, connected: None, transmitting: false });
 
             log::info!("[TX] Done sidx={}", sidx);
