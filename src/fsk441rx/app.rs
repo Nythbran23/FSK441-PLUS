@@ -4,6 +4,10 @@
 use eframe::egui;
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 use tokio::sync::mpsc;
 use chrono::{DateTime, Utc};
 
@@ -583,12 +587,14 @@ impl Fsk441App {
                 }
             };
 
-            match Command::new(&rigctld_cmd)
-                .args(["-m", &settings.rig_model,
-                       "-r", &settings.rig_port,
-                       "-s", &baud.to_string(),
-                       "-P", "RIG"])
-                .spawn()
+            let mut cmd = Command::new(&rigctld_cmd);
+            cmd.args(["-m", &settings.rig_model,
+                      "-r", &settings.rig_port,
+                      "-s", &baud.to_string(),
+                      "-P", "RIG"]);
+            #[cfg(windows)]
+            cmd.creation_flags(CREATE_NO_WINDOW);
+            match cmd.spawn()
             {
                 Ok(c)  => {
                     log::info!("[LAUNCHER] rigctld started (pid={})", c.id());
@@ -670,13 +676,14 @@ impl Fsk441App {
         log::info!("[LAUNCHER] Starting rigctld: {} model={} port={} baud={}",
             rigctld_cmd, self.settings.rig_model, self.settings.rig_port, baud);
 
-        match Command::new(&rigctld_cmd)
-            .args(["-m", &self.settings.rig_model,
-                   "-r", &self.settings.rig_port,
-                   "-s", &baud.to_string(),
-                   "-P", "RIG"])
-            .spawn()
-        {
+        let mut cmd = Command::new(&rigctld_cmd);
+        cmd.args(["-m", &self.settings.rig_model,
+                  "-r", &self.settings.rig_port,
+                  "-s", &baud.to_string(),
+                  "-P", "RIG"]);
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        match cmd.spawn() {
             Ok(c) => {
                 log::info!("[LAUNCHER] rigctld started (pid={})", c.id());
                 std::thread::sleep(std::time::Duration::from_millis(800));
@@ -1166,6 +1173,7 @@ impl Fsk441App {
 
 impl eframe::App for Fsk441App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.set_visuals(egui::Visuals::dark());
         self.poll_events();
         // Click on empty space in central panel deselects
         if ctx.input(|i| i.pointer.any_click()) {
