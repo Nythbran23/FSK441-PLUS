@@ -9,6 +9,31 @@ use tokio::net::TcpStream;
 use crate::params::*;
 use cpal::traits::{DeviceTrait, HostTrait};
 
+/// Output sample rate — Windows USB devices reject 11025Hz, need 48000Hz.
+/// macOS/Linux work fine at SAMPLE_RATE directly.
+#[cfg(target_os = "windows")]
+const OUTPUT_SAMPLE_RATE: u32 = 48_000;
+#[cfg(not(target_os = "windows"))]
+const OUTPUT_SAMPLE_RATE: u32 = SAMPLE_RATE;
+
+/// Upsample from SAMPLE_RATE (11025) to OUTPUT_SAMPLE_RATE (48000) on Windows.
+/// On macOS/Linux this is a no-op since OUTPUT_SAMPLE_RATE == SAMPLE_RATE.
+fn upsample(samples: &[f32]) -> Vec<f32> {
+    if OUTPUT_SAMPLE_RATE == SAMPLE_RATE { return samples.to_vec(); }
+    let ratio = OUTPUT_SAMPLE_RATE as f64 / SAMPLE_RATE as f64;
+    let out_len = (samples.len() as f64 * ratio).ceil() as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src = i as f64 / ratio;
+        let idx = src as usize;
+        let frac = (src - idx as f64) as f32;
+        let a = samples.get(idx).copied().unwrap_or(0.0);
+        let b = samples.get(idx + 1).copied().unwrap_or(0.0);
+        out.push(a + frac * (b - a));
+    }
+    out
+}
+
 // ─── FSK441 encoding ─────────────────────────────────────────────────────────
 
 fn char_to_dits(c: char) -> Option<(u8, u8, u8)> {
@@ -142,27 +167,44 @@ fn open_persistent_output_stream(
                 }
             };
 
-            // Try requested config first, fall back to device default channels
+            // Log ALL supported configs so we know exactly what this device accepts
+            log::info!("[WASAPI] Enumerating supported output configs for '{}'",
+                device.name().unwrap_or_default());
+            if let Ok(configs) = device.supported_output_configs() {
+                for c in configs {
+                    log::info!("[WASAPI] Supported: ch={} rate={}-{} format={:?} buf={:?}",
+                        c.channels(),
+                        c.min_sample_rate().0,
+                        c.max_sample_rate().0,
+                        c.sample_format(),
+                        c.buffer_size());
+                }
+            }
+            if let Ok(def) = device.default_output_config() {
+                log::info!("[WASAPI] Default config: ch={} rate={} format={:?}",
+                    def.channels(), def.sample_rate().0, def.sample_format());
+            }
+
             let requested = cpal::StreamConfig {
                 channels: 1,
-                sample_rate: cpal::SampleRate(SAMPLE_RATE),
+                sample_rate: cpal::SampleRate(OUTPUT_SAMPLE_RATE),
                 buffer_size: cpal::BufferSize::Fixed(AUDIO_BUFFER_SIZE as u32),
             };
             let (stream_config, channels) = {
                 let test = device.build_output_stream(&requested, |_: &mut [f32], _| {}, |_| {}, None);
                 if test.is_ok() {
                     drop(test);
-                    log::info!("[WASAPI] Using requested config (1ch Fixed)");
+                    log::info!("[WASAPI] Using 1ch Fixed at {}Hz", OUTPUT_SAMPLE_RATE);
                     (requested, 1usize)
                 } else {
                     let def = device.default_output_config().unwrap();
                     let ch = def.channels() as usize;
                     let fallback = cpal::StreamConfig {
                         channels: ch as u16,
-                        sample_rate: cpal::SampleRate(SAMPLE_RATE),
+                        sample_rate: cpal::SampleRate(OUTPUT_SAMPLE_RATE),
                         buffer_size: cpal::BufferSize::Default,
                     };
-                    log::info!("[WASAPI] Falling back to {}ch Default buffer", ch);
+                    log::info!("[WASAPI] Falling back to {}ch Default at {}Hz", ch, OUTPUT_SAMPLE_RATE);
                     (fallback, ch)
                 }
             };
@@ -305,11 +347,15 @@ fn play_audio_blocking(samples: Vec<f32>, device_name: Option<String>, cancel: s
 
     log::info!("[TX] Playing on: '{}'", device.name().unwrap_or_default());
 
+    // Upsample to device output rate (48000Hz — devices reject 11025Hz on Windows)
+    let samples = upsample(&samples);
+    let n = samples.len();
+
     // Build output stream — try Fixed 1ch first, fall back to device default channels
     use cpal::traits::{DeviceTrait, StreamTrait};
     let requested = cpal::StreamConfig {
         channels: 1,
-        sample_rate: cpal::SampleRate(SAMPLE_RATE),
+        sample_rate: cpal::SampleRate(OUTPUT_SAMPLE_RATE),
         buffer_size: cpal::BufferSize::Fixed(AUDIO_BUFFER_SIZE as u32),
     };
     let (stream_config, channels) = {
@@ -322,14 +368,15 @@ fn play_audio_blocking(samples: Vec<f32>, device_name: Option<String>, cancel: s
             let ch = def.channels() as usize;
             let fallback = cpal::StreamConfig {
                 channels: ch as u16,
-                sample_rate: cpal::SampleRate(SAMPLE_RATE),
+                sample_rate: cpal::SampleRate(OUTPUT_SAMPLE_RATE),
                 buffer_size: cpal::BufferSize::Default,
             };
-            log::info!("[TX] Falling back to {}ch Default buffer", ch);
+            log::info!("[TX] Falling back to {}ch Default at {}Hz", ch, OUTPUT_SAMPLE_RATE);
             (fallback, ch)
         }
     };
-    log::info!("[TX] play_audio_blocking: {}ch config", channels);
+    log::info!("[TX] play_audio_blocking: {}ch {}Hz {} samples",
+        channels, OUTPUT_SAMPLE_RATE, n);
     // Put samples in a shared buffer
     let buf = std::sync::Arc::new(std::sync::Mutex::new(samples.to_vec()));
     let buf2 = buf.clone();
@@ -365,9 +412,8 @@ fn play_audio_blocking(samples: Vec<f32>, device_name: Option<String>, cancel: s
     }
 
     // Drop PTT 200ms before audio ends so rig switches to RX as last samples drain
-    let _ptt_off_ms = (n as u64 * 1000 / SAMPLE_RATE as u64).saturating_sub(200);
-    let total_ms    = (n as u64 * 1000 / SAMPLE_RATE as u64) + 500;
-    log::info!("[TX] Playing {} samples ({:.1}s)", n, n as f32 / SAMPLE_RATE_F);
+    let total_ms = (n as u64 * 1000 / OUTPUT_SAMPLE_RATE as u64) + 500;
+    log::info!("[TX] Playing {} samples ({:.1}s)", n, n as f32 / OUTPUT_SAMPLE_RATE as f32);
     let mut elapsed = 0u64;
     while elapsed < total_ms {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -839,8 +885,9 @@ impl TxEngine {
             #[cfg(target_os = "windows")]
             {
                 if let Some(ref audio_tx) = win_audio_tx {
-                    let n_samples = waveform.len();
-                    if let Err(e) = audio_tx.send(waveform) {
+                    let upsampled = upsample(&waveform);
+                    let n_samples = upsampled.len();
+                    if let Err(e) = audio_tx.send(upsampled) {
                         log::error!("[TX] WASAPI send failed: {}", e);
                     } else {
                         log::info!("[TX] Windows: sent {} samples to WASAPI thread, waiting {}ms",
