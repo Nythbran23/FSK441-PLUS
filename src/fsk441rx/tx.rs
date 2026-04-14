@@ -772,11 +772,12 @@ impl TxEngine {
             #[cfg(target_os = "windows")]
             {
                 if let Some(ref audio_tx) = win_audio_tx {
+                    let n_samples = waveform.len();
                     if let Err(e) = audio_tx.send(waveform) {
                         log::error!("[TX] WASAPI send failed: {}", e);
                     } else {
                         log::info!("[TX] Windows: sent {} samples to WASAPI thread, waiting {}ms",
-                            waveform.len(), wait_ms);
+                            n_samples, wait_ms);
                         // Poll every 100ms so STOP/cancel is responsive
                         let mut elapsed = 0u64;
                         while elapsed < wait_ms {
