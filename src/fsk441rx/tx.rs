@@ -113,6 +113,69 @@ fn find_output_device(display_name: &str) -> Option<cpal::Device> {
 
 // ─── Audio playback — uses msk2k_audio AudioOutputBuilder ────────────────────
 
+/// Open a persistent CPAL output stream for Windows WASAPI.
+/// Returns a SyncSender — send a Vec<f32> waveform to play it.
+/// The stream plays silence when no data is in the buffer.
+#[cfg(target_os = "windows")]
+fn open_persistent_output_stream(device_name: Option<String>) -> Option<std::sync::mpsc::SyncSender<Vec<f32>>> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    let host = cpal::default_host();
+    let device = if let Some(ref name) = device_name {
+        find_output_device(name).or_else(|| host.default_output_device())
+    } else {
+        host.default_output_device()
+    };
+    let device = match device {
+        Some(d) => d,
+        None => { log::error!("[TX] No output device for persistent stream"); return None; }
+    };
+    let stream_config = cpal::StreamConfig {
+        channels: 1,
+        sample_rate: cpal::SampleRate(SAMPLE_RATE),
+        buffer_size: cpal::BufferSize::Fixed(AUDIO_BUFFER_SIZE as u32),
+    };
+    // Bounded channel — holds one full waveform
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
+    let buf_writer = buf.clone();
+    let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+
+    let stream = match device.build_output_stream(
+        &stream_config,
+        move |out: &mut [f32], _| {
+            // Drain new waveform from channel into buffer
+            if let Ok(rx) = rx.lock() {
+                while let Ok(data) = rx.try_recv() {
+                    let mut b = buf_writer.lock().unwrap();
+                    b.extend_from_slice(&data);
+                }
+            }
+            let mut b = buf_writer.lock().unwrap();
+            let n = out.len().min(b.len());
+            if n > 0 {
+                out[..n].copy_from_slice(&b[..n]);
+                b.drain(..n);
+            }
+            // Fill remainder with silence
+            out[n..].fill(0.0);
+        },
+        |e| log::error!("[TX] Persistent stream error: {}", e),
+        None,
+    ) {
+        Ok(s) => s,
+        Err(e) => { log::error!("[TX] Failed to build persistent output stream: {}", e); return None; }
+    };
+    if let Err(e) = stream.play() {
+        log::error!("[TX] Failed to start persistent stream: {}", e);
+        return None;
+    }
+    // Leak the stream — it must live for the duration of the engine
+    std::mem::forget(stream);
+    log::info!("[TX] Windows persistent output stream opened on '{}'",
+        device_name.as_deref().unwrap_or("default"));
+    Some(tx)
+}
+
 /// Toggle RTS or DTR line on a serial port for hardware PTT
 fn set_serial_ptt(port_name: &str, method: &PttMethod, active: bool) {
     match serialport::new(port_name, 9600)
@@ -456,12 +519,20 @@ impl TxEngine {
 
         // Start persistent hamlib client (PTT + freq polling)
         let mut hamlib_enabled = self.hamlib_addr.is_some();
-        // HamlibClient polls frequency internally every 2s — no external poll needed
         let hamlib: Option<HamlibClient> = self.hamlib_addr.as_ref().map(|addr| {
             HamlibClient::new(addr.clone(), self.hamlib_update_tx.clone())
         });
-        
-        // Poll frequency every ~2s
+
+        // ── Windows: persistent output stream ────────────────────────────────
+        // On Windows WASAPI, opening/closing the output stream each TX produces
+        // timing glitches and unreliable durations. Keep the stream open for the
+        // session lifetime and just feed waveform data when transmitting — WASAPI
+        // fills with silence automatically when the buffer empties.
+        // macOS/Linux: open/close each TX as before.
+        #[cfg(target_os = "windows")]
+        let win_audio_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>> = {
+            open_persistent_output_stream(self.output_device.clone())
+        };
 
         let mut current: Option<TxCommand> = None;
         let mut tx_count = 0u8;
@@ -636,16 +707,36 @@ impl TxEngine {
                         set_serial_ptt(port, &self.ptt_method, true);
                     }
                 }
-                PttMethod::Vox => {} // VOX — audio output triggers PTT
+                PttMethod::Vox => {}
             }
             let _ = self.hamlib_update_tx.send(HamlibUpdate { freq: None, connected: None, transmitting: true });
 
-            // Play audio
-            let device = dev.or_else(|| self.output_device.clone());
-            let cancel_clone = cancel_flag.clone();
-            tokio::task::spawn_blocking(move || {
-                play_audio_blocking(waveform, device, cancel_clone);
-            }).await.ok();
+            let duration_ms = waveform.len() as u64 * 1000 / SAMPLE_RATE as u64;
+            let wait_ms = duration_ms + 500;
+
+            // Play audio — Windows uses persistent stream to avoid WASAPI timing issues
+            #[cfg(target_os = "windows")]
+            {
+                if let Some(ref audio_tx) = win_audio_tx {
+                    let _ = audio_tx.send(waveform);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms)).await;
+                } else {
+                    // Fallback if persistent stream failed to open
+                    let device = dev.or_else(|| self.output_device.clone());
+                    let cancel_clone = cancel_flag.clone();
+                    tokio::task::spawn_blocking(move || {
+                        play_audio_blocking(waveform, device, cancel_clone);
+                    }).await.ok();
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let device = dev.or_else(|| self.output_device.clone());
+                let cancel_clone = cancel_flag.clone();
+                tokio::task::spawn_blocking(move || {
+                    play_audio_blocking(waveform, device, cancel_clone);
+                }).await.ok();
+            }
 
             // PTT off
             match &self.ptt_method {
@@ -663,12 +754,11 @@ impl TxEngine {
 
             log::info!("[TX] Done sidx={}", sidx);
 
-            // Wait for the slot to end before looping — prevents re-triggering
-            // on the same slot's remaining time after play_audio_blocking returns early.
+            // Wait for the slot to end before looping
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 let now_sidx = slot_idx_p(utc_ms(), self.period);
-                if now_sidx != sidx { break; }  // slot has rolled over
+                if now_sidx != sidx { break; }
                 if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) { break; }
             }
         }
