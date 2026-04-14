@@ -151,7 +151,7 @@ fn open_persistent_output_stream(
             let stream_config = cpal::StreamConfig {
                 channels: 1,
                 sample_rate: cpal::SampleRate(SAMPLE_RATE),
-                buffer_size: cpal::BufferSize::Fixed(AUDIO_BUFFER_SIZE as u32),
+                buffer_size: cpal::BufferSize::Default, // Fixed rejected by WASAPI shared mode
             };
             let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
             let buf2 = buf.clone();
@@ -288,7 +288,7 @@ fn play_audio_blocking(samples: Vec<f32>, device_name: Option<String>, cancel: s
     let stream_config = cpal::StreamConfig {
         channels: 1,
         sample_rate: cpal::SampleRate(SAMPLE_RATE),
-        buffer_size: cpal::BufferSize::Fixed(AUDIO_BUFFER_SIZE as u32),
+        buffer_size: cpal::BufferSize::Default, // Fixed rejected by WASAPI shared mode
     };
     // Put samples in a shared buffer
     let buf = std::sync::Arc::new(std::sync::Mutex::new(samples.to_vec()));
