@@ -4,6 +4,10 @@
 use eframe::egui;
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 use tokio::sync::mpsc;
 use chrono::{DateTime, Utc};
 
@@ -200,12 +204,14 @@ pub struct DecodeEntry {
     #[allow(dead_code)]
     my_call:        String,
     df_bin_hz:      Option<i32>,
-    passed_threshold: bool,  // false = shown only in RAW mode  // set for accumulated rows — used to update in place
+    passed_threshold: bool,
+    #[allow(dead_code)]
     is_second_pass:   bool,
+    #[allow(dead_code)]
     second_pass_chars: Vec<(char, bool)>,
 }
 
-enum EngineEvent { Decode(DecodeEntry), Accumulated(AccumulatedDecode), Hamlib(HamlibUpdate), Spectrum(Vec<f32>, f32), AnalysisSaved(i64, usize), SecondPassDecodes(Vec<second_pass::SecondPassResult>), NoiseStats { mean: f32, sigma: f32, threshold: f32, last_conf: f32 }, ConfUpdate(f32) }
+enum EngineEvent { Decode(DecodeEntry), Accumulated(AccumulatedDecode), Hamlib(HamlibUpdate), Spectrum(Vec<f32>, f32), AnalysisSaved(i64, usize), SecondPassDecodes(Vec<second_pass::SecondPassResult>), NoiseStats { mean: f32, sigma: f32, threshold: f32 }, ConfUpdate(f32) }
 
 
 /// Find cty.dat — checks next to binary first, then ~/MSK2Ksoft, then current dir.
@@ -239,7 +245,6 @@ struct Settings {
     hamlib_enabled: bool,
     their_call_hint: Option<String>,
     station_tracker_enabled: bool,
-    station_min_pings:       usize,
     rig_model:      String,
     rig_port:       String,
     rig_baud:       String,
@@ -269,7 +274,6 @@ impl Default for Settings {
             hamlib_enabled: true,
             their_call_hint: None,
             station_tracker_enabled: true,
-            station_min_pings: 1,
             rig_model:      String::new(),
             rig_port:       String::new(),
             rig_baud:       "19200".into(),
@@ -584,13 +588,14 @@ impl Fsk441App {
                 }
             };
 
-            match Command::new(&rigctld_cmd)
-                .args(["-m", &settings.rig_model,
-                       "-r", &settings.rig_port,
-                       "-s", &baud.to_string(),
-                       "-P", "RIG"])
-                .spawn()
-            {
+            let mut cmd = Command::new(&rigctld_cmd);
+            cmd.args(["-m", &settings.rig_model,
+                      "-r", &settings.rig_port,
+                      "-s", &baud.to_string(),
+                      "-P", "RIG"]);
+            #[cfg(windows)]
+            cmd.creation_flags(CREATE_NO_WINDOW);
+            match cmd.spawn() {
                 Ok(c)  => {
                     log::info!("[LAUNCHER] rigctld started (pid={})", c.id());
                     rigctld_guard = Some(ProcessGuard(c));
@@ -713,7 +718,7 @@ impl Fsk441App {
                     if self.df_dots.len() > 2000 { self.df_dots.remove(0); }
                     continue;
                 }
-                EngineEvent::NoiseStats { mean, sigma, threshold, last_conf: _ } => {
+                EngineEvent::NoiseStats { mean, sigma, threshold } => {
                     self.noise_mean = mean;
                     self.noise_sigma = sigma;
                     self.adaptive_threshold = threshold;
@@ -1133,6 +1138,7 @@ impl Fsk441App {
 
 impl eframe::App for Fsk441App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.set_visuals(egui::Visuals::dark());
         self.poll_events();
         // Click on empty space in central panel deselects
         if ctx.input(|i| i.pointer.any_click()) {
@@ -2657,6 +2663,7 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
     // Warm up counter — use user setting until we have enough pings to trust the EMA
     let mut ema_ping_count: u32 = 0;
     const EMA_WARMUP_PINGS: u32 = 500; // ~1-2 minutes of pings before EMA takes over
+    // Background optimiser: run every 30 minutes
     // Brief startup delay — allow audio stream to stabilise before accepting pings
     let engine_start = std::time::Instant::now();
     const STARTUP_MS: u128 = 3000;
@@ -2786,10 +2793,8 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
         // ── Adaptive noise floor update ──────────────────────────────────────
         // Only pings below current threshold feed the EMA — self-protecting
         // against signal contamination and interference spikes.
-        // Also exclude the first RX frame after TX (was_transmitting) to avoid
-        // any audio bleed from the TX→RX transition skewing the noise estimate.
         let conf = result.mean_confidence;
-        if conf < adaptive_conf_threshold && !was_transmitting {
+        if conf < adaptive_conf_threshold {
             let delta = conf - noise_mean;
             noise_mean += EMA_ALPHA * delta;
             noise_var   = (1.0 - EMA_ALPHA) * (noise_var + EMA_ALPHA * delta * delta);
@@ -2815,7 +2820,7 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
                 noise_mean, noise_sigma, adaptive_conf_threshold, settings.k_sigma);
             let _ = event_tx.send(EngineEvent::NoiseStats {
                 mean: noise_mean, sigma: noise_sigma,
-                threshold: adaptive_conf_threshold, last_conf: conf,
+                threshold: adaptive_conf_threshold,
             });
         }
 

@@ -254,6 +254,7 @@ impl PeriodTimer {
 
 // ─── TX commands ─────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum PttMethod {
     CatHamlib,
@@ -661,6 +662,15 @@ impl TxEngine {
             let _ = self.hamlib_update_tx.send(HamlibUpdate { freq: None, connected: None, transmitting: false });
 
             log::info!("[TX] Done sidx={}", sidx);
+
+            // Wait for the slot to end before looping — prevents re-triggering
+            // on the same slot's remaining time after play_audio_blocking returns early.
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                let now_sidx = slot_idx_p(utc_ms(), self.period);
+                if now_sidx != sidx { break; }  // slot has rolled over
+                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) { break; }
+            }
         }
     }
 }
