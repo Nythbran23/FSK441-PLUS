@@ -155,9 +155,17 @@ fn open_persistent_output_stream(
             };
             let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
             let buf2 = buf.clone();
+            let callback_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let callback_count2 = callback_count.clone();
             let stream = match device.build_output_stream(
                 &stream_config,
                 move |out: &mut [f32], _| {
+                    let count = callback_count2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Log every ~5 seconds (at 48000Hz / 1024 buf = ~47 callbacks/sec, so 235 = ~5s)
+                    if count % 235 == 0 {
+                        log::info!("[WASAPI] Stream callback #{} — still alive, buf={}",
+                            count, buf2.lock().map(|b| b.len()).unwrap_or(0));
+                    }
                     let mut b = buf2.lock().unwrap();
                     let n = out.len().min(b.len());
                     if n > 0 {
@@ -187,17 +195,24 @@ fn open_persistent_output_stream(
 
             // Park this thread forever — it owns the COM apartment.
             // Receive waveforms and push into shared buffer.
+            log::info!("[WASAPI] Thread entering recv loop — COM apartment locked");
             loop {
                 match cmd_rx.recv() {
                     Ok(samples) => {
                         if samples.is_empty() {
-                            // Clear command — drain buffer
+                            log::info!("[WASAPI] Clear command received — draining buffer");
                             buf.lock().unwrap().clear();
                         } else {
+                            let n = samples.len();
                             buf.lock().unwrap().extend_from_slice(&samples);
+                            log::info!("[WASAPI] Waveform received: {} samples, buf now {} samples",
+                                n, buf.lock().unwrap().len());
                         }
                     }
-                    Err(_) => break, // sender dropped — engine shutting down
+                    Err(e) => {
+                        log::error!("[WASAPI] cmd_rx error: {} — thread exiting", e);
+                        break;
+                    }
                 }
             }
             drop(stream);
