@@ -526,11 +526,17 @@ impl Fsk441App {
         let s = settings.clone();
         let (settings_watch_tx, settings_watch_rx) = tokio::sync::watch::channel(s.clone());
 
+        // Shared tx_active atomic — written by TxEngine AND UI, read by run_engine
+        let tx_active_for_app    = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tx_active_for_engine = tx_active_for_app.clone();
+        let tx_active_for_tx     = tx_active_for_app.clone();
+
         let tx_engine = tx::TxEngine::new(
             tx_cmd_rx, settings.period,
             settings.audio_out(),
             settings.hamlib_addr(),
             hamlib_tx,
+            tx_active_for_tx,
         );
         rt.spawn(async move { tx_engine.run().await; });
 
@@ -543,9 +549,6 @@ impl Fsk441App {
             }
         });
 
-        // Spawn RX engine
-        let tx_active_for_engine = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let tx_active_for_app    = tx_active_for_engine.clone();
         let et = event_tx.clone();
         rt.spawn(async move { run_engine(s, et, tx_active_for_engine, settings_watch_rx).await; });
 
@@ -1130,9 +1133,9 @@ impl Fsk441App {
         log::info!("[APP] HALT from halt_tx()");
         let _ = self.tx_cmd_tx.send(TxCommand::Halt);
         self.is_transmitting = false;
-        // Ungate the audio fanout so spectrum and detector resume immediately
-        log::info!("[TX_ACTIVE] halt_tx: setting false at {}", chrono::Utc::now().format("%H:%M:%S%.3f"));
-        self.tx_active.store(false, std::sync::atomic::Ordering::Relaxed);
+        // tx_active is now controlled by TxEngine directly — it will set false
+        // when PTT actually drops after audio finishes. Don't force it here or
+        // we'll start decoding our own TX audio before it stops.
     }
 }
 
@@ -1647,6 +1650,15 @@ impl eframe::App for Fsk441App {
                             .fixed_decimals(1))
                             .on_hover_text("Signal separation factor: gate = noise_mean + k × sigma\nLower = more sensitive, Higher = more selective");
                         if k_resp.changed() {
+                            let _ = self.settings_watch_tx.send(self.settings.clone());
+                        }
+                        ui.separator();
+                        ui.label(egui::RichText::new("NF floor").color(egui::Color32::from_gray(200)).monospace())
+                            .on_hover_text("Minimum conf gate floor\n0.62 = theoretical FSK441 limit\nLower = catches weak fragments for accumulator\nDefault 0.58");
+                        let nf_resp = ui.add(egui::Slider::new(&mut self.settings.min_conf, 0.40..=0.80)
+                            .fixed_decimals(2))
+                            .on_hover_text("Minimum conf gate floor. Lower catches more weak signal energy for the accumulator. Raise if seeing garbage.");
+                        if nf_resp.changed() {
                             let _ = self.settings_watch_tx.send(self.settings.clone());
                         }
                     });
@@ -2654,17 +2666,16 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
     // α=0.001 → time constant ~1000 pings ≈ 3 minutes at typical ping rates.
     // Only pings BELOW current adaptive_conf_threshold feed the EMA, so real
     // signal bursts and interference spikes don't contaminate the noise estimate.
-    // threshold = max(noise_mean + K*noise_sigma, CONF_FLOOR)
-    // CONF_FLOOR = 0.62 — theoretical FSK441 decodability limit at minimum Eb/N0.
+    // threshold = max(noise_mean + K*noise_sigma, min_conf)
+    // min_conf is user-adjustable (default 0.58) — the NF floor slider
+    // Lower = more sensitive, catches weak accumulator fragments
+    // Higher = cleaner, fewer false passes
     const EMA_ALPHA:    f32 = 0.001;
-    const CONF_FLOOR:   f32 = 0.62;  // theoretical minimum decodable conf
-    let mut noise_mean:     f32 = 0.44;  // sensible starting point for FSK441 noise
-    let mut noise_var:      f32 = 0.0004; // ≈ σ=0.02 initially
-    let mut adaptive_conf_threshold: f32 = settings.min_conf; // start with user setting
-    // Warm up counter — use user setting until we have enough pings to trust the EMA
+    let mut noise_mean:     f32 = 0.44;
+    let mut noise_var:      f32 = 0.0004;
+    let mut adaptive_conf_threshold: f32 = settings.min_conf;
     let mut ema_ping_count: u32 = 0;
-    const EMA_WARMUP_PINGS: u32 = 500; // ~1-2 minutes of pings before EMA takes over
-    // Background optimiser: run every 30 minutes
+    const EMA_WARMUP_PINGS: u32 = 500;
     // Brief startup delay — allow audio stream to stabilise before accepting pings
     let engine_start = std::time::Instant::now();
     const STARTUP_MS: u128 = 3000;
@@ -2815,8 +2826,7 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
             if ema_ping_count >= EMA_WARMUP_PINGS {
                 let noise_sigma = noise_var.sqrt();
                 adaptive_conf_threshold = (noise_mean + settings.k_sigma * noise_sigma)
-                    .max(CONF_FLOOR)
-                    .max(settings.min_conf)
+                    .max(settings.min_conf)  // user NF floor — the primary control
                     .min(0.90);
             }
         }

@@ -485,6 +485,7 @@ pub struct TxEngine {
     pub hamlib_update_tx:  mpsc::UnboundedSender<HamlibUpdate>,
     pub ptt_method:        PttMethod,
     pub ptt_port:          Option<String>,
+    pub tx_active:         std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TxEngine {
@@ -494,8 +495,9 @@ impl TxEngine {
         output_device:    Option<String>,
         hamlib_addr:      Option<String>,
         hamlib_update_tx: mpsc::UnboundedSender<HamlibUpdate>,
+        tx_active:        std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self { Self { cmd_rx, period, output_device, hamlib_addr, hamlib_update_tx,
-        ptt_method: PttMethod::CatHamlib, ptt_port: None } }
+        ptt_method: PttMethod::CatHamlib, ptt_port: None, tx_active } }
 
     pub async fn run(mut self) {
         let mut tx_par: u8 = match self.period {
@@ -535,6 +537,20 @@ impl TxEngine {
                     TxCommand::Halt => {
                         log::info!("[TX] HALT");
                         cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        // Drop PTT and ungate fanout immediately — audio will drain/stop
+                        self.tx_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                        let _ = self.hamlib_update_tx.send(HamlibUpdate { freq: None, connected: None, transmitting: false });
+                        match &self.ptt_method {
+                            PttMethod::CatHamlib => {
+                                if hamlib_enabled { if let Some(ref h) = hamlib { h.set_ptt(false); } }
+                            }
+                            PttMethod::RtsPort | PttMethod::DtrPort => {
+                                if let Some(ref port) = self.ptt_port {
+                                    set_serial_ptt(port, &self.ptt_method, false);
+                                }
+                            }
+                            PttMethod::Vox => {}
+                        }
                         current = None; tx_count = 0; last_tx_sidx = None; cmd_queued_sidx = None;
                     }
                     TxCommand::SetPeriod(p) => {
@@ -682,7 +698,8 @@ impl TxEngine {
                 waveform.len(), waveform.len() as f32 / SAMPLE_RATE_F,
                 repeats, msg_len * 1000 / SAMPLE_RATE as usize);
 
-            // PTT on
+            // PTT on — write tx_active immediately so run_engine sees it without UI roundtrip
+            self.tx_active.store(true, std::sync::atomic::Ordering::Relaxed);
             match &self.ptt_method {
                 PttMethod::CatHamlib => {
                     if hamlib_enabled { if let Some(ref h) = hamlib { h.set_ptt(true); } }
@@ -729,7 +746,8 @@ impl TxEngine {
                 }).await.ok();
             }
 
-            // PTT off
+            // PTT off — clear tx_active immediately
+            self.tx_active.store(false, std::sync::atomic::Ordering::Relaxed);
             match &self.ptt_method {
                 PttMethod::CatHamlib => {
                     if hamlib_enabled { if let Some(ref h) = hamlib { h.set_ptt(false); } }
