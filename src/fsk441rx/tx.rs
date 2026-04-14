@@ -113,57 +113,108 @@ fn find_output_device(display_name: &str) -> Option<cpal::Device> {
 
 // ─── Audio playback — uses msk2k_audio AudioOutputBuilder ────────────────────
 
-/// Open a persistent CPAL output stream for Windows WASAPI.
-/// Returns a shared buffer — push samples into it to play audio.
-/// The stream plays silence when the buffer is empty.
-/// Stream is leaked intentionally — must live for the engine lifetime.
+/// Open a persistent CPAL output stream for Windows WASAPI on a **dedicated std::thread**.
+///
+/// Windows WASAPI requires the thread that initialises the COM apartment to remain
+/// alive and parked on that same thread for the lifetime of the stream. Tokio worker
+/// threads are pooled and reassigned on every `.await`, which silently kills the
+/// WASAPI stream 1-2 seconds after the first yield. The fix is to pin the entire
+/// CPAL lifecycle to one immortal std::thread that never yields to Tokio.
+///
+/// Returns a SyncSender — send a Vec<f32> waveform to play it.
+/// Send an empty Vec to clear the buffer (e.g. on STOP).
 #[cfg(target_os = "windows")]
 fn open_persistent_output_stream(
     device_name: Option<String>,
-) -> Option<std::sync::Arc<std::sync::Mutex<Vec<f32>>>> {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    let host = cpal::default_host();
-    let device = if let Some(ref name) = device_name {
-        find_output_device(name).or_else(|| host.default_output_device())
-    } else {
-        host.default_output_device()
-    };
-    let device = match device {
-        Some(d) => d,
-        None => { log::error!("[TX] No output device for persistent stream"); return None; }
-    };
-    let stream_config = cpal::StreamConfig {
-        channels: 1,
-        sample_rate: cpal::SampleRate(SAMPLE_RATE),
-        buffer_size: cpal::BufferSize::Fixed(AUDIO_BUFFER_SIZE as u32),
-    };
-    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
-    let buf2 = buf.clone();
-    let stream = match device.build_output_stream(
-        &stream_config,
-        move |out: &mut [f32], _| {
-            let mut b = buf2.lock().unwrap();
-            let n = out.len().min(b.len());
-            if n > 0 {
-                out[..n].copy_from_slice(&b[..n]);
-                b.drain(..n);
+) -> Option<std::sync::mpsc::SyncSender<Vec<f32>>> {
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(4);
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
+
+    std::thread::Builder::new()
+        .name("wasapi-audio".into())
+        .spawn(move || {
+            use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+            let host = cpal::default_host();
+            let device = if let Some(ref name) = device_name {
+                find_output_device(name).or_else(|| host.default_output_device())
+            } else {
+                host.default_output_device()
+            };
+            let device = match device {
+                Some(d) => d,
+                None => {
+                    log::error!("[TX] WASAPI thread: no output device");
+                    let _ = ready_tx.send(false);
+                    return;
+                }
+            };
+            let stream_config = cpal::StreamConfig {
+                channels: 1,
+                sample_rate: cpal::SampleRate(SAMPLE_RATE),
+                buffer_size: cpal::BufferSize::Fixed(AUDIO_BUFFER_SIZE as u32),
+            };
+            let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
+            let buf2 = buf.clone();
+            let stream = match device.build_output_stream(
+                &stream_config,
+                move |out: &mut [f32], _| {
+                    let mut b = buf2.lock().unwrap();
+                    let n = out.len().min(b.len());
+                    if n > 0 {
+                        out[..n].copy_from_slice(&b[..n]);
+                        b.drain(..n);
+                    }
+                    out[n..].fill(0.0);
+                },
+                |e| log::error!("[TX] WASAPI stream error: {}", e),
+                None,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("[TX] WASAPI build_output_stream failed: {}", e);
+                    let _ = ready_tx.send(false);
+                    return;
+                }
+            };
+            if let Err(e) = stream.play() {
+                log::error!("[TX] WASAPI stream.play failed: {}", e);
+                let _ = ready_tx.send(false);
+                return;
             }
-            out[n..].fill(0.0);
-        },
-        |e| log::error!("[TX] Persistent stream error: {}", e),
-        None,
-    ) {
-        Ok(s) => s,
-        Err(e) => { log::error!("[TX] Failed to build persistent output stream: {}", e); return None; }
-    };
-    if let Err(e) = stream.play() {
-        log::error!("[TX] Failed to start persistent stream: {}", e);
-        return None;
+            log::info!("[TX] WASAPI dedicated thread: stream running on '{}'",
+                device.name().unwrap_or_default());
+            let _ = ready_tx.send(true);
+
+            // Park this thread forever — it owns the COM apartment.
+            // Receive waveforms and push into shared buffer.
+            loop {
+                match cmd_rx.recv() {
+                    Ok(samples) => {
+                        if samples.is_empty() {
+                            // Clear command — drain buffer
+                            buf.lock().unwrap().clear();
+                        } else {
+                            buf.lock().unwrap().extend_from_slice(&samples);
+                        }
+                    }
+                    Err(_) => break, // sender dropped — engine shutting down
+                }
+            }
+            drop(stream);
+        })
+        .ok()?;
+
+    // Wait for thread to confirm stream is running
+    match ready_rx.recv() {
+        Ok(true) => {
+            log::info!("[TX] WASAPI persistent stream ready");
+            Some(cmd_tx)
+        }
+        _ => {
+            log::error!("[TX] WASAPI persistent stream failed to start");
+            None
+        }
     }
-    std::mem::forget(stream);
-    log::info!("[TX] Windows persistent output stream opened on '{}'",
-        device_name.as_deref().unwrap_or("default"));
-    Some(buf)
 }
 
 /// Toggle RTS or DTR line on a serial port for hardware PTT
@@ -515,9 +566,9 @@ impl TxEngine {
             HamlibClient::new(addr.clone(), self.hamlib_update_tx.clone())
         });
 
-        // ── Windows: persistent output stream ────────────────────────────────
+        // ── Windows: persistent output stream on dedicated thread ─────────────
         #[cfg(target_os = "windows")]
-        let win_audio_buf: Option<std::sync::Arc<std::sync::Mutex<Vec<f32>>>> = {
+        let win_audio_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>> = {
             open_persistent_output_stream(self.output_device.clone())
         };
 
@@ -717,17 +768,28 @@ impl TxEngine {
             #[allow(unused_variables)]
             let wait_ms = duration_ms + 500;
 
-            // Play audio — Windows uses persistent stream to avoid WASAPI timing issues
+            // Play audio — Windows uses persistent dedicated-thread stream
             #[cfg(target_os = "windows")]
             {
-                if let Some(ref audio_buf) = win_audio_buf {
-                    {
-                        let mut b = audio_buf.lock().unwrap();
-                        b.extend_from_slice(&waveform);
+                if let Some(ref audio_tx) = win_audio_tx {
+                    if let Err(e) = audio_tx.send(waveform) {
+                        log::error!("[TX] WASAPI send failed: {}", e);
+                    } else {
+                        log::info!("[TX] Windows: sent {} samples to WASAPI thread, waiting {}ms",
+                            waveform.len(), wait_ms);
+                        // Poll every 100ms so STOP/cancel is responsive
+                        let mut elapsed = 0u64;
+                        while elapsed < wait_ms {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            elapsed += 100;
+                            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                // Clear audio buffer on the WASAPI thread
+                                let _ = audio_tx.send(vec![]);
+                                log::info!("[TX] Windows: cancelled after {}ms", elapsed);
+                                break;
+                            }
+                        }
                     }
-                    log::info!("[TX] Windows: pushed {} samples to persistent stream, sleeping {}ms",
-                        waveform.len(), wait_ms);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms)).await;
                 } else {
                     // Fallback if persistent stream failed to open
                     let device = dev.or_else(|| self.output_device.clone());
