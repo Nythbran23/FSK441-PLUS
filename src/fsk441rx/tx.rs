@@ -115,7 +115,6 @@ fn find_output_device(display_name: &str) -> Option<cpal::Device> {
 
 /// Toggle RTS or DTR line on a serial port for hardware PTT
 fn set_serial_ptt(port_name: &str, method: &PttMethod, active: bool) {
-    use serialport::SerialPort;
     match serialport::new(port_name, 9600)
         .timeout(std::time::Duration::from_millis(100))
         .open()

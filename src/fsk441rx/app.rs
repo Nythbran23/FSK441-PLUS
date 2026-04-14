@@ -4,10 +4,6 @@
 use eframe::egui;
 use std::path::PathBuf;
 use std::process::Command;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 use tokio::sync::mpsc;
 use chrono::{DateTime, Utc};
 
@@ -23,7 +19,6 @@ mod qso;
 mod spectrum;
 mod accumulator;
 mod adif;
-mod analysis;
 mod scatter;
 mod second_pass;
 
@@ -32,9 +27,8 @@ use demod::longx;
 use filter::ParsedMessage;
 use store::{Store, AnalysisPing};
 use adif::{AdifLogger, QsoRecord};
-use analysis::ThresholdSuggestion;
 use geo::{GeoValidator, PrefixDb, Qth};
-use tx::{TxCommand, PttMethod, PeriodTimer, Period, SlotState, HamlibUpdate};
+use tx::{TxCommand, PeriodTimer, Period, SlotState, HamlibUpdate};
 use spectrum::{compute_column, heat_color, FSK441_TONES_HZ, DISPLAY_BINS, hz_to_bin};
 use accumulator::{FragmentAccumulator, Fragment, AccumulatedDecode};
 use qso::{QsoState, on_decode, Transition};
@@ -211,7 +205,7 @@ pub struct DecodeEntry {
     second_pass_chars: Vec<(char, bool)>,
 }
 
-enum EngineEvent { Decode(DecodeEntry), Accumulated(AccumulatedDecode), Hamlib(HamlibUpdate), Spectrum(Vec<f32>, f32), AnalysisSaved(i64, usize), ThresholdAnalysis(Box<ThresholdSuggestion>), SecondPassDecodes(Vec<second_pass::SecondPassResult>) }
+enum EngineEvent { Decode(DecodeEntry), Accumulated(AccumulatedDecode), Hamlib(HamlibUpdate), Spectrum(Vec<f32>, f32), AnalysisSaved(i64, usize), SecondPassDecodes(Vec<second_pass::SecondPassResult>), NoiseStats { mean: f32, sigma: f32, threshold: f32, last_conf: f32 }, ConfUpdate(f32) }
 
 
 /// Find cty.dat — checks next to binary first, then ~/MSK2Ksoft, then current dir.
@@ -253,18 +247,16 @@ struct Settings {
     cty_path:       String,
     max_km:         f64,
     threshold:      f32,
-    min_ccf:        f32,
-    min_conf:       f32,
+    min_ccf:        f32,   // kept for config backwards compat only
+    min_conf:       f32,   // floor on adaptive threshold during warmup
+    k_sigma:        f32,   // sensitivity: threshold = noise_mean + k_sigma * sigma
     clear_accumulator: bool,
-    their_df_hz:      Option<f32>, // learned DF of QSO partner
+    their_df_hz:      Option<f32>,
     tx_level:       f32,
-    ant_bw_horiz:   f32,   // antenna 3 dB horizontal beamwidth (°)
-    ant_bw_vert:    f32,   // antenna 3 dB vertical beamwidth (°)
-    arm2_ccf:       f32,   // Arm 2 min CCF (weak high-conf pings)
-    arm2_conf:      f32,   // Arm 2 min confidence
-    save_max_data:  bool,  // retain analysis_pings in DB after scoring
-    ptt_method:     PttMethod,
-    ptt_port:       String,  // serial port for RTS/DTR PTT (empty = not set)
+    ant_bw_horiz:   f32,
+    ant_bw_vert:    f32,
+    save_max_data:  bool,
+    qsy_reset:      bool,  // pulse: reset EMA on QSY
 }
 
 impl Default for Settings {
@@ -285,18 +277,16 @@ impl Default for Settings {
             cty_path:       default_cty_path(),
             max_km:         3000.0,
             threshold:      3.0,
-            min_ccf:        100.0,
-            min_conf:       0.45,
+            min_ccf:        200.0,  // legacy — not used in gate
+            min_conf:       0.58,   // warmup floor
+            k_sigma:        5.0,    // μ + 5σ default
             clear_accumulator: false,
             their_df_hz: None,
             tx_level:       0.1,
             ant_bw_horiz:   40.0,
             ant_bw_vert:    40.0,
-            arm2_ccf:       40.0,
-            arm2_conf:      0.80,
             save_max_data:  false,
-            ptt_method:     PttMethod::CatHamlib,
-            ptt_port:       String::new(),
+            qsy_reset:      false,
         }
     }
 }
@@ -485,7 +475,7 @@ struct Fsk441App {
     wf_columns:      Vec<Vec<f32>>,
     df_dots:         Vec<DfDot>,   // DF scatter strip history
     wf_amplitude:    Vec<f32>,  // RMS amplitude per column (0..1)
-    audio_rms:       f32,       // latest RMS for input level indicator
+    last_conf:       f32,       // confidence of most recent decoded ping
     wf_period_idx:   i64,  // slot index when columns last cleared
     tx_msgs_key:     String,       // last key used to populate — repopulate only on change
     qso_log:         Vec<String>,
@@ -502,12 +492,13 @@ struct Fsk441App {
     _runtime:        tokio::runtime::Runtime,
     _rigctld:        Option<ProcessGuard>,
     settings_watch_tx: tokio::sync::watch::Sender<Settings>,
-    recalibrate_tx:    mpsc::UnboundedSender<()>,   // triggers immediate optimiser run
     qso_time_on:       Option<chrono::DateTime<chrono::Utc>>,
     qso_logged:        bool,
     adif_logger:       AdifLogger,
     adif_log:          Vec<QsoRecord>,
-    last_analysis:     Option<Box<ThresholdSuggestion>>,
+    noise_mean:        f32,   // live noise floor mean conf
+    noise_sigma:       f32,   // live noise floor sigma
+    adaptive_threshold: f32,  // live adaptive conf threshold
     // Second-pass decoder
     event_tx:            mpsc::UnboundedSender<EngineEvent>,
     second_pass_db_path: String,
@@ -530,7 +521,6 @@ impl Fsk441App {
 
         let s = settings.clone();
         let (settings_watch_tx, settings_watch_rx) = tokio::sync::watch::channel(s.clone());
-        let (recalibrate_tx, recalibrate_rx) = mpsc::unbounded_channel::<()>();
 
         let tx_engine = tx::TxEngine::new(
             tx_cmd_rx, settings.period,
@@ -553,7 +543,7 @@ impl Fsk441App {
         let tx_active_for_engine = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let tx_active_for_app    = tx_active_for_engine.clone();
         let et = event_tx.clone();
-        rt.spawn(async move { run_engine(s, et, tx_active_for_engine, settings_watch_rx, recalibrate_rx).await; });
+        rt.spawn(async move { run_engine(s, et, tx_active_for_engine, settings_watch_rx).await; });
 
         // Auto-launch rigctld if hamlib enabled and rig configured — same as MSK2K
         let mut rigctld_guard: Option<ProcessGuard> = None;
@@ -594,14 +584,12 @@ impl Fsk441App {
                 }
             };
 
-            let mut cmd = Command::new(&rigctld_cmd);
-            cmd.args(["-m", &settings.rig_model,
-                      "-r", &settings.rig_port,
-                      "-s", &baud.to_string(),
-                      "-P", "RIG"]);
-            #[cfg(windows)]
-            cmd.creation_flags(CREATE_NO_WINDOW);
-            match cmd.spawn()
+            match Command::new(&rigctld_cmd)
+                .args(["-m", &settings.rig_model,
+                       "-r", &settings.rig_port,
+                       "-s", &baud.to_string(),
+                       "-P", "RIG"])
+                .spawn()
             {
                 Ok(c)  => {
                     log::info!("[LAUNCHER] rigctld started (pid={})", c.id());
@@ -631,37 +619,13 @@ impl Fsk441App {
         qso_logged: false,
         adif_logger: AdifLogger::new(&AdifLogger::default_path()),
         adif_log: Vec::new(),
-        // Check DB at startup — if threshold_history exists, hide Reset & Recalibrate button
-        // by using Some(placeholder). Real result arrives after first optimiser run.
-        last_analysis: {
-            let db_path = {
-                let mut p = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-                p.push(".fsk441"); p.push("fsk441.db");
-                p
-            };
-            if let Ok(store) = crate::store::Store::open(&db_path) {
-                if !store.needs_calibration() {
-                    // Mature DB — suppress button until first real optimiser result
-                    Some(Box::new(ThresholdSuggestion {
-                        analysed_at: String::new(), window_hours: 0.0,
-                        n_noise_pings: 0, n_signal_pings: 0, n_confirmed_qsos: 0,
-                        noise_ccf_p95: 0.0, noise_ccf_p99: 0.0,
-                        noise_conf_p95: 0.0, noise_conf_p99: 0.0,
-                        current_arm1_ccf: settings.min_ccf, current_arm1_conf: settings.min_conf,
-                        current_arm2_ccf: settings.arm2_ccf, current_arm2_conf: settings.arm2_conf,
-                        current_recall: 0.0, current_precision: 0.0, current_f1: 0.0,
-                        suggested_arm1_ccf: settings.min_ccf, suggested_arm1_conf: settings.min_conf,
-                        suggested_arm2_ccf: settings.arm2_ccf, suggested_arm2_conf: settings.arm2_conf,
-                        suggested_recall: 0.0, suggested_precision: 0.0, suggested_f1: 0.0,
-                        summary: String::new(), auto_apply: false,
-                    }))
-                } else { None }
-            } else { None }
-        },
+        noise_mean: 0.44,
+        noise_sigma: 0.02,
+        adaptive_threshold: 0.58,
         wf_amplitude: Vec::new(),
-        audio_rms: 0.0,
+        last_conf: 0.0,
         wf_period_idx: -1,
-        tx_msgs: Default::default(), tx_msgs_key: String::new(), qso_log: Vec::new(), seen_calls: Vec::new(), station_tracker: StationTracker::default(), qso_summary: None, settings_watch_tx, recalibrate_tx, rig_freq_hz: None,
+        tx_msgs: Default::default(), tx_msgs_key: String::new(), qso_log: Vec::new(), seen_calls: Vec::new(), station_tracker: StationTracker::default(), qso_summary: None, settings_watch_tx, rig_freq_hz: None,
             base_freq_hz: None,
             freq_edit: String::new(),
             freq_editing: false, cat_connected: false, last_cat_rx: None, _rigctld: rigctld_guard, settings, _runtime: rt,
@@ -672,61 +636,6 @@ impl Fsk441App {
             p.push(".fsk441"); p.push("fsk441.db");
             p.to_string_lossy().to_string()
         },
-        }
-    }
-
-    fn launch_rigctld(&self) -> Option<ProcessGuard> {
-        // Kill any existing instance first — platform-specific
-        if cfg!(windows) {
-            let _ = Command::new("taskkill").args(["/F", "/IM", "rigctld.exe"]).output();
-        } else {
-            let _ = Command::new("pkill").args(["-f", "rigctld"]).output();
-        }
-
-        if !self.settings.hamlib_enabled
-            || self.settings.rig_model.is_empty()
-            || self.settings.rig_port.is_empty()
-        {
-            log::info!("[LAUNCHER] Hamlib disabled or incomplete settings — rigctld not started");
-            return None;
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(300));
-
-        let baud: u32 = self.settings.rig_baud.parse().unwrap_or(19200);
-        let name = if cfg!(windows) { "rigctld.exe" } else { "rigctld" };
-        let rigctld_cmd = std::env::current_exe().ok()
-            .and_then(|e| e.parent().map(|d| d.to_path_buf()))
-            .and_then(|dir| {
-                let tools = dir.join("tools").join(name);
-                if tools.exists() { return Some(tools); }
-                let adj = dir.join(name);
-                if adj.exists() { return Some(adj); }
-                None
-            })
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| if cfg!(windows) { "rigctld.exe" } else { "rigctld" }.to_string());
-
-        log::info!("[LAUNCHER] Starting rigctld: {} model={} port={} baud={}",
-            rigctld_cmd, self.settings.rig_model, self.settings.rig_port, baud);
-
-        let mut cmd = Command::new(&rigctld_cmd);
-        cmd.args(["-m", &self.settings.rig_model,
-                  "-r", &self.settings.rig_port,
-                  "-s", &baud.to_string(),
-                  "-P", "RIG"]);
-        #[cfg(windows)]
-        cmd.creation_flags(CREATE_NO_WINDOW);
-        match cmd.spawn() {
-            Ok(c) => {
-                log::info!("[LAUNCHER] rigctld started (pid={})", c.id());
-                std::thread::sleep(std::time::Duration::from_millis(800));
-                Some(ProcessGuard(c))
-            }
-            Err(e) => {
-                log::error!("[LAUNCHER] rigctld failed ({}): {}", rigctld_cmd, e);
-                None
-            }
         }
     }
 
@@ -804,19 +713,14 @@ impl Fsk441App {
                     if self.df_dots.len() > 2000 { self.df_dots.remove(0); }
                     continue;
                 }
-                EngineEvent::ThresholdAnalysis(suggestion) => {
-                    if suggestion.auto_apply {
-                        // Auto-apply on recalibration or first-run calibration
-                        self.settings.min_ccf   = suggestion.suggested_arm1_ccf;
-                        self.settings.min_conf  = suggestion.suggested_arm1_conf;
-                        self.settings.arm2_ccf  = suggestion.suggested_arm2_ccf;
-                        self.settings.arm2_conf = suggestion.suggested_arm2_conf;
-                        save_config(&self.settings);
-                        let _ = self.settings_watch_tx.send(self.settings.clone());
-                        log::info!("[ANALYSIS] Auto-applied thresholds: CCF≥{:.0} conf≥{:.2}",
-                            suggestion.suggested_arm1_ccf, suggestion.suggested_arm1_conf);
-                    }
-                    self.last_analysis = Some(suggestion);
+                EngineEvent::NoiseStats { mean, sigma, threshold, last_conf: _ } => {
+                    self.noise_mean = mean;
+                    self.noise_sigma = sigma;
+                    self.adaptive_threshold = threshold;
+                    continue;
+                }
+                EngineEvent::ConfUpdate(c) => {
+                    self.last_conf = c;
                     continue;
                 }
                 EngineEvent::AnalysisSaved(capture_id, n) => {
@@ -845,7 +749,7 @@ impl Fsk441App {
                     let ctx = second_pass::QsoContext {
                         my_call, their_call, their_loc,
                         report_sent, report_rcvd, stage,
-                        noise_floor: self.settings.min_conf,
+                        noise_floor: self.adaptive_threshold,
                         retain_after_run: self.settings.save_max_data,
                     };
                     let et = self.event_tx.clone();
@@ -910,11 +814,21 @@ impl Fsk441App {
                     }
                     self.wf_columns.push(bins);
                     self.wf_amplitude.push(rms);
-                    self.audio_rms = rms;
                     continue;
                 }
                 EngineEvent::Hamlib(upd) => {
                     if let Some(f) = upd.freq {
+                        // Detect significant QSY (>10kHz) — reset EMA noise floor
+                        if let Some(prev) = self.rig_freq_hz {
+                            let delta_hz = (f as i64 - prev as i64).abs();
+                            if delta_hz > 10_000 {
+                                log::info!("[NOISE] QSY detected ({:.3}→{:.3} MHz) — resetting noise floor EMA",
+                                    prev as f64 / 1e6, f as f64 / 1e6);
+                                self.settings.qsy_reset = true;
+                                let _ = self.settings_watch_tx.send(self.settings.clone());
+                                self.settings.qsy_reset = false;
+                            }
+                        }
                         self.rig_freq_hz  = Some(f);
                         if self.base_freq_hz.is_none() { self.base_freq_hz = Some(f); }
                         self.cat_connected = true;
@@ -1219,7 +1133,6 @@ impl Fsk441App {
 
 impl eframe::App for Fsk441App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.set_visuals(egui::Visuals::dark());
         self.poll_events();
         // Click on empty space in central panel deselects
         if ctx.input(|i| i.pointer.any_click()) {
@@ -1445,57 +1358,6 @@ impl eframe::App for Fsk441App {
                         self.settings_open = !self.settings_open;
                         if self.settings_open { self.refresh_audio_devices(); }
                     }
-                    ui.separator();
-
-                    // Audio input level indicator — colour-coded bargraph
-                    // RMS thresholds: <0.01 = silent/too low, 0.01-0.5 = good, >0.5 = hot
-                    let rms = self.audio_rms;
-                    let (bar_col, label_col, tip) = if rms < 0.01 {
-                        (egui::Color32::from_rgb(100, 100, 100),
-                         egui::Color32::from_rgb(160, 160, 160),
-                         "Input level too low — check audio source")
-                    } else if rms > 0.5 {
-                        (egui::Color32::from_rgb(220, 60, 60),
-                         egui::Color32::from_rgb(255, 100, 100),
-                         "Input level too high — risk of clipping. Reduce rig USB output or audio card gain")
-                    } else if rms > 0.3 {
-                        (egui::Color32::from_rgb(220, 180, 40),
-                         egui::Color32::from_rgb(240, 200, 60),
-                         "Input level high but usable")
-                    } else {
-                        (egui::Color32::from_rgb(40, 200, 100),
-                         egui::Color32::from_gray(200),
-                         "Input level good")
-                    };
-
-                    ui.label(egui::RichText::new("RX")
-                        .color(label_col).small())
-                        .on_hover_text(tip);
-
-                    // 8-segment bargraph
-                    let bar_resp = ui.allocate_response(
-                        egui::vec2(48.0, 12.0), egui::Sense::hover());
-                    let rect = bar_resp.rect;
-                    let painter = ui.painter();
-                    let segments = 8usize;
-                    let filled = ((rms / 0.6).min(1.0) * segments as f32).ceil() as usize;
-                    let seg_w = rect.width() / segments as f32 - 1.0;
-                    for i in 0..segments {
-                        let x = rect.left() + i as f32 * (seg_w + 1.0);
-                        let seg_rect = egui::Rect::from_min_size(
-                            egui::pos2(x, rect.top()),
-                            egui::vec2(seg_w, rect.height()),
-                        );
-                        let col = if i < filled {
-                            if i >= 6 { egui::Color32::from_rgb(220, 60, 60) }
-                            else if i >= 5 { egui::Color32::from_rgb(220, 180, 40) }
-                            else { bar_col }
-                        } else {
-                            egui::Color32::from_gray(40)
-                        };
-                        painter.rect_filled(seg_rect, 1.0, col);
-                    }
-                    bar_resp.on_hover_text(tip);
                 });
             });
         });
@@ -1747,13 +1609,41 @@ impl eframe::App for Fsk441App {
                         self.qso_time_on = None;
                         self.qso_logged = false;
                         self.active_tx_idx = None;
-                        // Clear decode list and accumulator
                         self.clear_decodes();
                         self.settings.clear_accumulator = true;
                         let _ = self.settings_watch_tx.send(self.settings.clone());
                         self.settings.clear_accumulator = false;
                         self.qso_log.push("--- Cleared ---".to_string());
                     }
+
+                    // NF, conf and k slider — right justified in this row
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(format!("NF {:.2}", self.adaptive_threshold))
+                            .color(egui::Color32::WHITE)
+                            .monospace())
+                            .on_hover_text(format!(
+                                "Adaptive noise floor gate\nμ={:.4}  σ={:.4}\nUpdates every ~5 minutes",
+                                self.noise_mean, self.noise_sigma));
+                        ui.separator();
+                        let conf_col = if self.last_conf >= self.adaptive_threshold {
+                            egui::Color32::from_rgb(0, 220, 100)
+                        } else {
+                            egui::Color32::from_gray(160)
+                        };
+                        ui.label(egui::RichText::new(format!("C {:.2}", self.last_conf))
+                            .color(conf_col)
+                            .monospace())
+                            .on_hover_text("Confidence of last decoded ping. Green = above noise gate.");
+                        ui.separator();
+                        ui.label(egui::RichText::new("k").color(egui::Color32::from_gray(200)).monospace())
+                            .on_hover_text("Signal separation factor: gate = noise_mean + k × sigma\nLower = more sensitive, Higher = more selective");
+                        let k_resp = ui.add(egui::Slider::new(&mut self.settings.k_sigma, 2.0..=10.0)
+                            .fixed_decimals(1))
+                            .on_hover_text("Signal separation factor: gate = noise_mean + k × sigma\nLower = more sensitive, Higher = more selective");
+                        if k_resp.changed() {
+                            let _ = self.settings_watch_tx.send(self.settings.clone());
+                        }
+                    });
                     // LOG QSO button — state machine:
                     //   can_log: call+time present, not yet logged
                     //   qso_logged: show greyed "✓ Logged" briefly, then hide
@@ -2559,54 +2449,6 @@ impl eframe::App for Fsk441App {
                         });
                     }
 
-                    // ── PTT Method ────────────────────────────────────────
-                    ui.separator();
-                    ui.heading("PTT");
-                    egui::Grid::new("ptt_grid")
-                        .num_columns(2).spacing([10.0, 8.0])
-                        .show(ui, |ui| {
-                        ui.label("PTT Method:");
-                        egui::ComboBox::from_id_salt("ptt_method")
-                            .selected_text(self.settings.ptt_method.label())
-                            .width(180.0)
-                            .show_ui(ui, |ui| {
-                                for method in &[PttMethod::CatHamlib, PttMethod::RtsPort,
-                                               PttMethod::DtrPort, PttMethod::Vox] {
-                                    ui.selectable_value(
-                                        &mut self.settings.ptt_method,
-                                        method.clone(), method.label());
-                                }
-                            });
-                        ui.end_row();
-
-                        // PTT port only shown for RTS/DTR
-                        if self.settings.ptt_method == PttMethod::RtsPort
-                            || self.settings.ptt_method == PttMethod::DtrPort
-                        {
-                            ui.label("PTT Port:");
-                            ui.horizontal(|ui| {
-                                let port_disp = if self.settings.ptt_port.is_empty() {
-                                    "Select Port...".to_string()
-                                } else {
-                                    self.settings.ptt_port.clone()
-                                };
-                                egui::ComboBox::from_id_salt("ptt_port")
-                                    .selected_text(&port_disp).width(200.0)
-                                    .show_ui(ui, |ui| {
-                                        for p in &self.serial_ports.clone() {
-                                            ui.selectable_value(
-                                                &mut self.settings.ptt_port,
-                                                p.clone(), p);
-                                        }
-                                    });
-                                if ui.button("🔄").clicked() {
-                                    self.serial_ports = enumerate_serial_ports();
-                                }
-                            });
-                            ui.end_row();
-                        }
-                    });
-
                     // ── Audio Hardware ────────────────────────────────────
                     ui.separator();
                     ui.heading("Audio Hardware");
@@ -2664,45 +2506,6 @@ impl eframe::App for Fsk441App {
                     egui::Grid::new("filt").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                         ui.label("cty.dat path:"); ui.text_edit_singleline(&mut self.settings.cty_path); ui.end_row();
                         ui.label("Max range (km):"); ui.add(egui::Slider::new(&mut self.settings.max_km, 500.0..=5000.0).integer()); ui.end_row();
-                        ui.label("Arm 1 CCF min:"); ui.add(egui::Slider::new(&mut self.settings.min_ccf, 30.0..=500.0).integer()); ui.end_row();
-                        ui.label("Arm 1 conf min:"); ui.add(egui::Slider::new(&mut self.settings.min_conf, 0.35..=0.95).fixed_decimals(2)); ui.end_row();
-                        ui.label("Arm 2 CCF min:"); ui.add(egui::Slider::new(&mut self.settings.arm2_ccf, 10.0..=200.0).integer()); ui.end_row();
-                        ui.label("Arm 2 conf min:"); ui.add(egui::Slider::new(&mut self.settings.arm2_conf, 0.50..=0.99).fixed_decimals(2)); ui.end_row();
-                        ui.end_row();
-                        // Optimiser suggestion
-                        ui.label("");
-                        if let Some(ref s) = self.last_analysis {
-                            if s.current_f1 == 0.0 {
-                                // Placeholder — real result pending first optimiser run
-                                ui.label(egui::RichText::new("Optimiser: runs every 30min — thresholds loaded from history")
-                                    .color(egui::Color32::from_gray(170)));
-                            } else if s.is_improvement() {
-                                ui.vertical(|ui| {
-                                    ui.label(egui::RichText::new(format!(
-                                        "Optimiser suggests  Arm1: CCF≥{:.0} conf≥{:.2}  Arm2: CCF≥{:.0} conf≥{:.2}  F1 {:.3}→{:.3}",
-                                        s.suggested_arm1_ccf, s.suggested_arm1_conf,
-                                        s.suggested_arm2_ccf, s.suggested_arm2_conf,
-                                        s.current_f1, s.suggested_f1,
-                                    )).color(egui::Color32::from_rgb(100, 220, 100)));
-                                    if ui.button("✓ Apply optimiser suggestion").clicked() {
-                                        self.settings.min_ccf   = s.suggested_arm1_ccf;
-                                        self.settings.min_conf  = s.suggested_arm1_conf;
-                                        self.settings.arm2_ccf  = s.suggested_arm2_ccf;
-                                        self.settings.arm2_conf = s.suggested_arm2_conf;
-                                        let _ = self.settings_watch_tx.send(self.settings.clone());
-                                    }
-                                });
-                            } else {
-                                ui.label(egui::RichText::new(format!(
-                                    "Optimiser: thresholds near-optimal  F1={:.3}  ({:.0}h window, {}sig/{}noise)",
-                                    s.current_f1, s.window_hours, s.n_signal_pings, s.n_noise_pings
-                                )).color(egui::Color32::from_gray(170)));
-                            }
-                        } else {
-                            ui.label(egui::RichText::new("Optimiser: runs every 30min once signals seen")
-                                .color(egui::Color32::from_gray(170)));
-                        }
-                        ui.end_row();
                     });
 
                     // ── Antenna ───────────────────────────────────────────
@@ -2719,40 +2522,6 @@ impl eframe::App for Fsk441App {
                         ui.end_row();
                     });
 
-                    // Reset & Recalibrate — only shown when no threshold history exists
-                    // (new DB, or after a manual reset). Disappears once optimiser has run.
-                    if self.last_analysis.is_none() {
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            if ui.add(egui::Button::new(
-                                egui::RichText::new("🔄 Reset & Recalibrate")
-                                    .color(egui::Color32::from_rgb(220, 160, 60))))
-                                .on_hover_text("Clear threshold history and re-train the noise filter from scratch.\nUse this if you are getting too much garbage or missing real signals.\nThresholds will be auto-applied after ~30 decodes.")
-                                .clicked()
-                            {
-                                let db_path = {
-                                    let mut p = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-                                    p.push(".fsk441"); p.push("fsk441.db");
-                                    p
-                                };
-                                if let Ok(store) = crate::store::Store::open(&db_path) {
-                                    match store.reset_for_recalibration() {
-                                        Ok(_) => {
-                                            log::info!("[ANALYSIS] Reset complete — recalibration will fire after 30 decodes");
-                                            let _ = self.recalibrate_tx.send(());
-                                            // Clear last_analysis so button stays visible until re-trained
-                                            self.last_analysis = None;
-                                        }
-                                        Err(e) => log::error!("[ANALYSIS] Reset failed: {}", e),
-                                    }
-                                }
-                            }
-                            ui.label(egui::RichText::new("Clears noise training — auto-retrains from current band conditions")
-                                .color(egui::Color32::from_gray(150))
-                                .italics());
-                        });
-                    }
-
                     ui.separator();
                     if ui.button("Save & Close").clicked() {
                         self.settings_open = false;
@@ -2762,13 +2531,11 @@ impl eframe::App for Fsk441App {
                         self.period_timer = PeriodTimer::new(self.settings.period);
                         let _ = self.tx_cmd_tx.send(TxCommand::SetOutputDevice(self.settings.audio_out()));
                         let _ = self.tx_cmd_tx.send(TxCommand::SetHamlib(self.settings.hamlib_addr()));
-                        let _ = self.tx_cmd_tx.send(TxCommand::SetPttMethod(
-                            self.settings.ptt_method.clone(),
-                            if self.settings.ptt_port.is_empty() { None }
-                            else { Some(self.settings.ptt_port.clone()) }
-                        ));
-                        // Restart rigctld with new settings (covers port/baud/model changes)
-                        self._rigctld = self.launch_rigctld();
+                        // Kill existing rigctld if hamlib disabled
+                        if !self.settings.hamlib_enabled {
+                            std::process::Command::new("pkill").args(["-f", "rigctld"]).spawn().ok();
+                            log::info!("[LAUNCHER] Hamlib disabled — killed rigctld");
+                        }
                     }
                 });
         }
@@ -2777,7 +2544,7 @@ impl eframe::App for Fsk441App {
 
 // ─── Engine ───────────────────────────────────────────────────────────────────
 
-async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEvent>, tx_active: std::sync::Arc<std::sync::atomic::AtomicBool>, mut settings_rx: tokio::sync::watch::Receiver<Settings>, mut recalibrate_rx: mpsc::UnboundedReceiver<()>) {
+async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEvent>, tx_active: std::sync::Arc<std::sync::atomic::AtomicBool>, mut settings_rx: tokio::sync::watch::Receiver<Settings>) {
     let mut settings = settings; // mutable local copy
 
     let qth = Qth::from_maidenhead(&settings.my_loc).unwrap_or_default();
@@ -2874,76 +2641,50 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
     // Analysis ring buffer: rolling 30s of soft-bit data, written on demand
     const RING_MAX: usize = 300; // ~300 pings max in 30s
     let mut analysis_ring: std::collections::VecDeque<AnalysisPing> = std::collections::VecDeque::with_capacity(RING_MAX);
-    // Background optimiser: run every 30 minutes
-    let mut last_optimiser_run = std::time::Instant::now()
-        .checked_sub(std::time::Duration::from_secs(25 * 60))  // run ~5min after start
-        .unwrap_or(std::time::Instant::now());
-    // Early auto-calibration: fire once when we have enough pings on a fresh DB
-    let needs_early_calibration = store.as_ref()
-        .map(|s| s.needs_calibration())
-        .unwrap_or(false);
-    let mut early_calibration_done = !needs_early_calibration;
-    let optimiser_db_path = {
-        let mut p = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-        p.push(".fsk441"); p.push("fsk441.db");
-        p.to_string_lossy().to_string()
-    };
+
+    // ── Adaptive noise floor tracker ─────────────────────────────────────────
+    // EMA of mean_confidence for pings below current threshold (noise only).
+    // α=0.001 → time constant ~1000 pings ≈ 3 minutes at typical ping rates.
+    // Only pings BELOW current adaptive_conf_threshold feed the EMA, so real
+    // signal bursts and interference spikes don't contaminate the noise estimate.
+    // threshold = max(noise_mean + K*noise_sigma, CONF_FLOOR)
+    // CONF_FLOOR = 0.62 — theoretical FSK441 decodability limit at minimum Eb/N0.
+    const EMA_ALPHA:    f32 = 0.001;
+    const CONF_FLOOR:   f32 = 0.62;  // theoretical minimum decodable conf
+    let mut noise_mean:     f32 = 0.44;  // sensible starting point for FSK441 noise
+    let mut noise_var:      f32 = 0.0004; // ≈ σ=0.02 initially
+    let mut adaptive_conf_threshold: f32 = settings.min_conf; // start with user setting
+    // Warm up counter — use user setting until we have enough pings to trust the EMA
+    let mut ema_ping_count: u32 = 0;
+    const EMA_WARMUP_PINGS: u32 = 500; // ~1-2 minutes of pings before EMA takes over
     // Brief startup delay — allow audio stream to stabilise before accepting pings
     let engine_start = std::time::Instant::now();
     const STARTUP_MS: u128 = 3000;
-    let mut tx_cooldown_until: Option<std::time::Instant> = None;
     let mut was_transmitting = false;
 
-    loop {
-        let ping_opt = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            ping_rx.recv()
-        ).await;
-
-        if let Ok(None) = ping_opt { break; }
-
+    while let Some(ping) = ping_rx.recv().await {
         let is_tx = tx_active.load(std::sync::atomic::Ordering::Relaxed);
-
-        // Background threshold optimiser — every 30 minutes, or triggered by recalibrate
-        let force_calibrate = recalibrate_rx.try_recv().is_ok();
-
-        // Early auto-calibration: fire once on fresh/reset DB after 30+ pings
-        let do_early = if !early_calibration_done {
-            store.as_ref().map(|s| s.count_pings() >= 30).unwrap_or(false)
-        } else { false };
-
-        if force_calibrate || do_early
-            || last_optimiser_run.elapsed() >= std::time::Duration::from_secs(30 * 60)
-        {
-            if do_early {
-                log::info!("[ANALYSIS] Early auto-calibration triggered after 30+ pings");
-                early_calibration_done = true;
-            }
-            if force_calibrate {
-                log::info!("[ANALYSIS] Recalibration triggered by user");
-            }
-            last_optimiser_run = std::time::Instant::now();
-            let db = optimiser_db_path.clone();
-            let et = event_tx.clone();
-            let auto_apply = force_calibrate || do_early;
-            let (a1c, a1f, a2c, a2f) = (
-                settings.min_ccf, settings.min_conf, settings.arm2_ccf, settings.arm2_conf,
-            );
-            tokio::task::spawn_blocking(move || {
-                match analysis::run_optimiser(&db, 24.0, a1c, a1f, a2c, a2f) {
-                    Ok(mut s) => {
-                        s.auto_apply = auto_apply;
-                        let _ = et.send(EngineEvent::ThresholdAnalysis(Box::new(s)));
-                    }
-                    Err(e) => { log::debug!("[ANALYSIS] Skipped: {}", e); }
-                }
-            });
-        }
 
         // Pull latest settings if changed (their_call_hint, period, etc.)
         if settings_rx.has_changed().unwrap_or(false) {
             let old_hint = settings.their_call_hint.clone();
             settings = settings_rx.borrow_and_update().clone();
+
+            // QSY detected — reset EMA immediately to new noise environment
+            if settings.qsy_reset {
+                noise_mean = 0.44;
+                noise_var  = 0.0004;
+                ema_ping_count = 0;
+                adaptive_conf_threshold = settings.min_conf;
+                log::info!("[NOISE] EMA reset after QSY — restarting noise floor measurement");
+            }
+
+            // If user raised min_conf above current adaptive threshold, raise it immediately
+            if settings.min_conf > adaptive_conf_threshold {
+                adaptive_conf_threshold = settings.min_conf;
+                log::info!("[NOISE] User raised conf floor to {:.2} — adaptive threshold updated",
+                    settings.min_conf);
+            }
 
             // Clear accumulator pulse — fired from LOG QSO button
             if settings.clear_accumulator {
@@ -2991,29 +2732,11 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
             }
             was_transmitting = true;
             frag_acc.prune_older_than(300); // housekeeping during TX
-            // Set cooldown so we reject ring-buffer bleed after TX ends
-            tx_cooldown_until = Some(std::time::Instant::now()
-                + std::time::Duration::from_millis(1500));
             frag_acc.clear();
             while ping_rx.try_recv().is_ok() {}
             continue;
         }
         was_transmitting = false;
-
-        // If this iteration was a timeout (no ping), nothing more to do
-        let ping = match ping_opt {
-            Ok(Some(p)) => p,
-            _ => continue,
-        };
-
-        // Reject pings during cooldown after TX (loopback tail)
-        if let Some(until) = tx_cooldown_until {
-            if std::time::Instant::now() < until {
-                continue;
-            } else {
-                tx_cooldown_until = None;
-            }
-        }
 
         // Detect slot boundary → process accumulated fragments (DON'T clear — persist cross-slot)
         let now_ms    = chrono::Utc::now().timestamp_millis();
@@ -3044,44 +2767,86 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
         let my_call_upper = settings.my_call.trim().to_uppercase();
         parsed.valid_callsigns.retain(|c| *c != my_call_upper);
         parsed.callsigns.retain(|c| *c != my_call_upper);
-        if let Some(ref s) = store { let _ = s.insert_ping(session_id, &ping, &result, &parsed); }
 
         if result.raw_decode.trim().len() < 2 { continue; }
 
         // Startup guard — ignore pings for first 3s while audio settles
         if engine_start.elapsed().as_millis() < STARTUP_MS { continue; }
 
-        // Hard guard: own TX leakage has CCF > 50000 — reject regardless of timing
-        if ping.ccf_ratio > 50_000.0 {
-            log::debug!("[ENGINE] Rejected own-TX leakage ping ccf={:.0}", ping.ccf_ratio);
+        // TX loopback guard — own audio leakage has astronomically high CCF.
+        // Legitimate overdense "rock crusher" pings can exceed 50,000 so we use
+        // 500,000 as the cap. Real TX leakage is typically 10x-100x higher than
+        // any meteor scatter ping. The tx_active blanking window is the primary
+        // defence; this is just a backstop for extreme loopback cases.
+        if ping.ccf_ratio > 500_000.0 {
+            log::debug!("[ENGINE] Rejected extreme-CCF ping (likely TX leakage) ccf={:.0}", ping.ccf_ratio);
             continue;
         }
 
-        // ── Threshold computation ────────────────────────────────────────────────
-        let in_qso = settings.their_call_hint.is_some();
-        let _has_callsign = !parsed.valid_callsigns.is_empty(); // geo-filtered
+        // ── Adaptive noise floor update ──────────────────────────────────────
+        // Only pings below current threshold feed the EMA — self-protecting
+        // against signal contamination and interference spikes.
+        // Also exclude the first RX frame after TX (was_transmitting) to avoid
+        // any audio bleed from the TX→RX transition skewing the noise estimate.
+        let conf = result.mean_confidence;
+        if conf < adaptive_conf_threshold && !was_transmitting {
+            let delta = conf - noise_mean;
+            noise_mean += EMA_ALPHA * delta;
+            noise_var   = (1.0 - EMA_ALPHA) * (noise_var + EMA_ALPHA * delta * delta);
+            ema_ping_count += 1;
 
-        // Our scoring pipeline
+            // Once warmed up, let the EMA drive the threshold
+            if ema_ping_count >= EMA_WARMUP_PINGS {
+                let noise_sigma = noise_var.sqrt();
+                adaptive_conf_threshold = (noise_mean + settings.k_sigma * noise_sigma)
+                    .max(CONF_FLOOR)
+                    .max(settings.min_conf)
+                    .min(0.90);
+            }
+        }
+
+        // Send conf of every ping to UI for live display (regardless of gate)
+        let _ = event_tx.send(EngineEvent::ConfUpdate(conf));
+
+        // Log and report adaptive threshold every ~5 minutes
+        if ema_ping_count > 0 && ema_ping_count % 1500 == 0 {
+            let noise_sigma = noise_var.sqrt();
+            log::info!("[NOISE] μ={:.4} σ={:.4} threshold={:.4} k={:.1}",
+                noise_mean, noise_sigma, adaptive_conf_threshold, settings.k_sigma);
+            let _ = event_tx.send(EngineEvent::NoiseStats {
+                mean: noise_mean, sigma: noise_sigma,
+                threshold: adaptive_conf_threshold, last_conf: conf,
+            });
+        }
+
+        // ── DB insert ────────────────────────────────────────────────────────
+        // Max Data ON: store everything the detector fires on (full research corpus)
+        // Max Data OFF: store only pings above the adaptive gate (lean operational DB)
+        // EMA always runs regardless of save_max_data — it's in-memory only
+        let should_store = settings.save_max_data || conf >= adaptive_conf_threshold;
+        if should_store {
+            if let Some(ref s) = store { let _ = s.insert_ping(session_id, &ping, &result, &parsed); }
+        }
+
+        // ── Single adaptive conf gate ────────────────────────────────────────
+        // Anything above adaptive_conf_threshold is above the noise floor and
+        // potentially real FSK441 signal. CCF is no longer used as a gate —
+        // conf alone determines whether energy is FSK441-modulated.
+        let in_qso = settings.their_call_hint.is_some();
+        let arm1_conf = adaptive_conf_threshold;
+
         let threshold_pass = if in_qso {
-            (ping.ccf_ratio >= settings.min_ccf && result.mean_confidence >= settings.min_conf)
-                || result.mean_confidence >= 0.70
+            conf >= arm1_conf || conf >= 0.70
         } else {
-            // ── Normal mode: two-arm threshold ────────────────────────────
-            // Arm 1: main gate — CCF≥arm1_ccf + conf≥arm1_conf
-            // Arm 2: weak-ping fallback — lower CCF accepted when confidence is high
-            let arm1 = ping.ccf_ratio >= settings.min_ccf
-                && result.mean_confidence >= settings.min_conf;
-            let arm2 = ping.ccf_ratio >= settings.arm2_ccf
-                && result.mean_confidence >= settings.arm2_conf;
-            arm1 || arm2
+            conf >= arm1_conf
         };
 
         // ── Accumulator feed — intentionally BEFORE display gate ────────────
-        // Feed any ping with conf≥0.40 regardless of CCF or score.
-        // The accumulator is designed to extract signal from weak pings;
-        // gating it at display threshold defeats its purpose entirely.
-        // Example: M2CEW at CCF=24, conf=0.87 is real data, just a short ping.
-        let accum_gate = result.mean_confidence >= 0.40
+        // Feed any ping with conf above noise_mean + 2σ regardless of CCF.
+        // This is below the display threshold but above random noise — captures
+        // real weak energy that the accumulator can integrate across multiple pings.
+        let accum_gate_conf = (noise_mean + 2.0 * noise_var.sqrt()).max(0.40);
+        let accum_gate = conf >= accum_gate_conf
             && result.raw_decode.trim().len() >= 2;
         if accum_gate {
             if let Some(frag) = Fragment::from_result(&result, ping.ccf_ratio) {
@@ -3098,9 +2863,8 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
         }
 
         // QSO content override — callsign matching is specific enough without DF gate
-        // Different meteor trails give different Doppler — don't restrict by DF
         let content_override = in_qso
-            && result.mean_confidence >= 0.45
+            && conf >= (noise_mean + 3.0 * noise_var.sqrt()).max(0.45)
             && {
                 if let Some(ref their) = settings.their_call_hint {
                     qso_content_match(&result.raw_decode, their)
@@ -3113,9 +2877,8 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
         // RAW mode = MSHV-equivalent: show what WSJT would show
         // Normal mode = our pipeline
         // In both cases threshold_pass drives colour coding
-        // Add to analysis ring buffer BEFORE display gate — captures ALL
-        // marginal pings (conf≥0.45) not just ones that pass display threshold
-        if result.mean_confidence >= 0.45 && !result.char_probs.is_empty() {
+        // Add to analysis ring buffer — captures pings near threshold for second-pass
+        if conf >= accum_gate_conf && !result.char_probs.is_empty() {
             let ap = AnalysisPing {
                 detected_at:     ping.timestamp.to_rfc3339(),
                 df_hz:           ping.df_hz,
@@ -3173,7 +2936,7 @@ fn save_config(s: &Settings) {
         Period::TxSecond15 => "second15",
     };
     let data = format!(
-        "my_call={}\nmy_loc={}\ninput={}\noutput={}\nrig_model={}\nrig_port={}\nrig_baud={}\nhamlib_enabled={}\nperiod={}\ncty_path={}\nmax_km={}\nmin_ccf={}\nmin_conf={}\ntx_level={}\nant_bw_horiz={}\nant_bw_vert={}\narm2_ccf={}\narm2_conf={}\nsave_max_data={}\nptt_method={}\nptt_port={}\n",
+        "my_call={}\nmy_loc={}\ninput={}\noutput={}\nrig_model={}\nrig_port={}\nrig_baud={}\nhamlib_enabled={}\nperiod={}\ncty_path={}\nmax_km={}\nmin_ccf={}\nmin_conf={}\ntx_level={}\nant_bw_horiz={}\nant_bw_vert={}\nk_sigma={}\nsave_max_data={}\n",
         s.my_call,
         s.my_loc,
         s.sel_in.as_deref().unwrap_or(""),
@@ -3190,11 +2953,8 @@ fn save_config(s: &Settings) {
         s.tx_level,
         s.ant_bw_horiz,
         s.ant_bw_vert,
-        s.arm2_ccf,
-        s.arm2_conf,
+        s.k_sigma,
         s.save_max_data,
-        s.ptt_method.to_str(),
-        s.ptt_port,
     );
     if let Err(e) = std::fs::write(config_path(), data) {
         log::warn!("Failed to save config: {}", e);
@@ -3226,18 +2986,16 @@ fn load_config() -> Settings {
                 _          => Period::TxSecond,
             },
             "cty_path"       => s.cty_path  = v.to_string(),
-            // will re-resolve below if path no longer valid
             "max_km"         => s.max_km    = v.parse().unwrap_or(3000.0),
-            "min_ccf"        => s.min_ccf   = v.parse().unwrap_or(100.0),
-            "min_conf"       => s.min_conf  = v.parse().unwrap_or(0.45),
-            "tx_level"       => s.tx_level  = v.parse().unwrap_or(0.8),
+            "min_ccf"        => s.min_ccf   = v.parse().unwrap_or(200.0),  // legacy
+            "min_conf"       => s.min_conf  = v.parse().unwrap_or(0.58),
+            "tx_level"       => s.tx_level  = v.parse().unwrap_or(0.1),
             "ant_bw_horiz"   => s.ant_bw_horiz = v.parse().unwrap_or(40.0),
             "ant_bw_vert"    => s.ant_bw_vert   = v.parse().unwrap_or(40.0),
-            "arm2_ccf"       => s.arm2_ccf      = v.parse().unwrap_or(40.0),
-            "arm2_conf"      => s.arm2_conf      = v.parse().unwrap_or(0.80),
+            "k_sigma"        => s.k_sigma       = v.parse().unwrap_or(5.0),
+            "arm2_ccf"       => {}  // legacy — silently ignored
+            "arm2_conf"      => {}  // legacy — silently ignored
             "save_max_data"  => s.save_max_data  = v == "true",
-            "ptt_method"     => s.ptt_method     = PttMethod::from_str(v),
-            "ptt_port"       => s.ptt_port        = v.to_string(),
             _ => {}
         }
     }
