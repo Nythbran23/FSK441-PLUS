@@ -113,16 +113,9 @@ fn find_output_device(display_name: &str) -> Option<cpal::Device> {
 
 // ─── Audio playback — uses msk2k_audio AudioOutputBuilder ────────────────────
 
-/// Open a persistent CPAL output stream for Windows WASAPI on a **dedicated std::thread**.
-///
-/// Windows WASAPI requires the thread that initialises the COM apartment to remain
-/// alive and parked on that same thread for the lifetime of the stream. Tokio worker
-/// threads are pooled and reassigned on every `.await`, which silently kills the
-/// WASAPI stream 1-2 seconds after the first yield. The fix is to pin the entire
-/// CPAL lifecycle to one immortal std::thread that never yields to Tokio.
-///
-/// Returns a SyncSender — send a Vec<f32> waveform to play it.
-/// Send an empty Vec to clear the buffer (e.g. on STOP).
+/// Open a persistent CPAL output stream for Windows WASAPI on a dedicated std::thread.
+/// Mirrors the MSK2K pattern: try Fixed buffer first, fall back to Default + device channels.
+/// Handles mono→stereo upmix if device only supports stereo.
 #[cfg(target_os = "windows")]
 fn open_persistent_output_stream(
     device_name: Option<String>,
@@ -148,69 +141,99 @@ fn open_persistent_output_stream(
                     return;
                 }
             };
-            let stream_config = cpal::StreamConfig {
+
+            // Try requested config first, fall back to device default channels
+            let requested = cpal::StreamConfig {
                 channels: 1,
                 sample_rate: cpal::SampleRate(SAMPLE_RATE),
-                buffer_size: cpal::BufferSize::Default, // Fixed rejected by WASAPI shared mode
+                buffer_size: cpal::BufferSize::Fixed(AUDIO_BUFFER_SIZE as u32),
             };
+            let (stream_config, channels) = {
+                let test = device.build_output_stream(&requested, |_: &mut [f32], _| {}, |_| {}, None);
+                if test.is_ok() {
+                    drop(test);
+                    log::info!("[WASAPI] Using requested config (1ch Fixed)");
+                    (requested, 1usize)
+                } else {
+                    let def = device.default_output_config().unwrap();
+                    let ch = def.channels() as usize;
+                    let fallback = cpal::StreamConfig {
+                        channels: ch as u16,
+                        sample_rate: cpal::SampleRate(SAMPLE_RATE),
+                        buffer_size: cpal::BufferSize::Default,
+                    };
+                    log::info!("[WASAPI] Falling back to {}ch Default buffer", ch);
+                    (fallback, ch)
+                }
+            };
+
             let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
             let buf2 = buf.clone();
             let callback_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let callback_count2 = callback_count.clone();
+
             let stream = match device.build_output_stream(
                 &stream_config,
                 move |out: &mut [f32], _| {
                     let count = callback_count2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // Log every ~5 seconds (at 48000Hz / 1024 buf = ~47 callbacks/sec, so 235 = ~5s)
                     if count % 235 == 0 {
-                        log::info!("[WASAPI] Stream callback #{} — still alive, buf={}",
+                        log::info!("[WASAPI] callback #{} alive, buf={}",
                             count, buf2.lock().map(|b| b.len()).unwrap_or(0));
                     }
                     let mut b = buf2.lock().unwrap();
-                    let n = out.len().min(b.len());
-                    if n > 0 {
-                        out[..n].copy_from_slice(&b[..n]);
-                        b.drain(..n);
+                    let frames = out.len() / channels;
+                    let copy = frames.min(b.len());
+                    if channels == 1 {
+                        out[..copy].copy_from_slice(&b[..copy]);
+                        b.drain(..copy);
+                        out[copy..].fill(0.0);
+                    } else {
+                        // Upmix mono→stereo (or more channels)
+                        for i in 0..copy {
+                            let s = b[i];
+                            for ch in 0..channels {
+                                out[i * channels + ch] = if ch == 0 { s } else { 0.0 };
+                            }
+                        }
+                        b.drain(..copy);
+                        out[copy * channels..].fill(0.0);
                     }
-                    out[n..].fill(0.0);
                 },
-                |e| log::error!("[TX] WASAPI stream error: {}", e),
+                |e| log::error!("[WASAPI] stream error: {}", e),
                 None,
             ) {
                 Ok(s) => s,
                 Err(e) => {
-                    log::error!("[TX] WASAPI build_output_stream failed: {}", e);
+                    log::error!("[WASAPI] build_output_stream failed: {}", e);
                     let _ = ready_tx.send(false);
                     return;
                 }
             };
+
             if let Err(e) = stream.play() {
-                log::error!("[TX] WASAPI stream.play failed: {}", e);
+                log::error!("[WASAPI] stream.play failed: {}", e);
                 let _ = ready_tx.send(false);
                 return;
             }
-            log::info!("[TX] WASAPI dedicated thread: stream running on '{}'",
-                device.name().unwrap_or_default());
+
+            log::info!("[WASAPI] Stream running on '{}' {}ch",
+                device.name().unwrap_or_default(), channels);
             let _ = ready_tx.send(true);
 
-            // Park this thread forever — it owns the COM apartment.
-            // Receive waveforms and push into shared buffer.
-            log::info!("[WASAPI] Thread entering recv loop — COM apartment locked");
             loop {
                 match cmd_rx.recv() {
                     Ok(samples) => {
                         if samples.is_empty() {
-                            log::info!("[WASAPI] Clear command received — draining buffer");
+                            log::info!("[WASAPI] Clear command — draining buffer");
                             buf.lock().unwrap().clear();
                         } else {
                             let n = samples.len();
                             buf.lock().unwrap().extend_from_slice(&samples);
-                            log::info!("[WASAPI] Waveform received: {} samples, buf now {} samples",
-                                n, buf.lock().unwrap().len());
+                            log::info!("[WASAPI] Waveform: {} samples queued", n);
                         }
                     }
                     Err(e) => {
-                        log::error!("[WASAPI] cmd_rx error: {} — thread exiting", e);
+                        log::error!("[WASAPI] cmd_rx error: {} — exiting", e);
                         break;
                     }
                 }
@@ -219,14 +242,13 @@ fn open_persistent_output_stream(
         })
         .ok()?;
 
-    // Wait for thread to confirm stream is running
     match ready_rx.recv() {
         Ok(true) => {
-            log::info!("[TX] WASAPI persistent stream ready");
+            log::info!("[WASAPI] Persistent stream ready");
             Some(cmd_tx)
         }
         _ => {
-            log::error!("[TX] WASAPI persistent stream failed to start");
+            log::error!("[WASAPI] Persistent stream failed to start");
             None
         }
     }
@@ -283,13 +305,31 @@ fn play_audio_blocking(samples: Vec<f32>, device_name: Option<String>, cancel: s
 
     log::info!("[TX] Playing on: '{}'", device.name().unwrap_or_default());
 
-    // Build output stream directly with cpal
+    // Build output stream — try Fixed 1ch first, fall back to device default channels
     use cpal::traits::{DeviceTrait, StreamTrait};
-    let stream_config = cpal::StreamConfig {
+    let requested = cpal::StreamConfig {
         channels: 1,
         sample_rate: cpal::SampleRate(SAMPLE_RATE),
-        buffer_size: cpal::BufferSize::Default, // Fixed rejected by WASAPI shared mode
+        buffer_size: cpal::BufferSize::Fixed(AUDIO_BUFFER_SIZE as u32),
     };
+    let (stream_config, channels) = {
+        let test = device.build_output_stream(&requested, |_: &mut [f32], _| {}, |_| {}, None);
+        if test.is_ok() {
+            drop(test);
+            (requested, 1usize)
+        } else {
+            let def = device.default_output_config().unwrap();
+            let ch = def.channels() as usize;
+            let fallback = cpal::StreamConfig {
+                channels: ch as u16,
+                sample_rate: cpal::SampleRate(SAMPLE_RATE),
+                buffer_size: cpal::BufferSize::Default,
+            };
+            log::info!("[TX] Falling back to {}ch Default buffer", ch);
+            (fallback, ch)
+        }
+    };
+    log::info!("[TX] play_audio_blocking: {}ch config", channels);
     // Put samples in a shared buffer
     let buf = std::sync::Arc::new(std::sync::Mutex::new(samples.to_vec()));
     let buf2 = buf.clone();
@@ -297,10 +337,22 @@ fn play_audio_blocking(samples: Vec<f32>, device_name: Option<String>, cancel: s
         &stream_config,
         move |out: &mut [f32], _| {
             let mut b = buf2.lock().unwrap();
-            let n = out.len().min(b.len());
-            out[..n].copy_from_slice(&b[..n]);
-            b.drain(..n);
-            if n < out.len() { out[n..].fill(0.0); }
+            let frames = out.len() / channels;
+            let copy = frames.min(b.len());
+            if channels == 1 {
+                out[..copy].copy_from_slice(&b[..copy]);
+                b.drain(..copy);
+                out[copy..].fill(0.0);
+            } else {
+                for i in 0..copy {
+                    let s = b[i];
+                    for ch in 0..channels {
+                        out[i * channels + ch] = if ch == 0 { s } else { 0.0 };
+                    }
+                }
+                b.drain(..copy);
+                out[copy * channels..].fill(0.0);
+            }
         },
         |e| log::error!("[TX] Output error: {}", e),
         None,
