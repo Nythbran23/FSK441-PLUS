@@ -114,10 +114,13 @@ fn find_output_device(display_name: &str) -> Option<cpal::Device> {
 // ─── Audio playback — uses msk2k_audio AudioOutputBuilder ────────────────────
 
 /// Open a persistent CPAL output stream for Windows WASAPI.
-/// Returns a SyncSender — send a Vec<f32> waveform to play it.
-/// The stream plays silence when no data is in the buffer.
+/// Returns a shared buffer — push samples into it to play audio.
+/// The stream plays silence when the buffer is empty.
+/// Stream is leaked intentionally — must live for the engine lifetime.
 #[cfg(target_os = "windows")]
-fn open_persistent_output_stream(device_name: Option<String>) -> Option<std::sync::mpsc::SyncSender<Vec<f32>>> {
+fn open_persistent_output_stream(
+    device_name: Option<String>,
+) -> Option<std::sync::Arc<std::sync::Mutex<Vec<f32>>>> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     let host = cpal::default_host();
     let device = if let Some(ref name) = device_name {
@@ -134,29 +137,17 @@ fn open_persistent_output_stream(device_name: Option<String>) -> Option<std::syn
         sample_rate: cpal::SampleRate(SAMPLE_RATE),
         buffer_size: cpal::BufferSize::Fixed(AUDIO_BUFFER_SIZE as u32),
     };
-    // Bounded channel — holds one full waveform
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
     let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
-    let buf_writer = buf.clone();
-    let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
-
+    let buf2 = buf.clone();
     let stream = match device.build_output_stream(
         &stream_config,
         move |out: &mut [f32], _| {
-            // Drain new waveform from channel into buffer
-            if let Ok(rx) = rx.lock() {
-                while let Ok(data) = rx.try_recv() {
-                    let mut b = buf_writer.lock().unwrap();
-                    b.extend_from_slice(&data);
-                }
-            }
-            let mut b = buf_writer.lock().unwrap();
+            let mut b = buf2.lock().unwrap();
             let n = out.len().min(b.len());
             if n > 0 {
                 out[..n].copy_from_slice(&b[..n]);
                 b.drain(..n);
             }
-            // Fill remainder with silence
             out[n..].fill(0.0);
         },
         |e| log::error!("[TX] Persistent stream error: {}", e),
@@ -169,11 +160,10 @@ fn open_persistent_output_stream(device_name: Option<String>) -> Option<std::syn
         log::error!("[TX] Failed to start persistent stream: {}", e);
         return None;
     }
-    // Leak the stream — it must live for the duration of the engine
     std::mem::forget(stream);
     log::info!("[TX] Windows persistent output stream opened on '{}'",
         device_name.as_deref().unwrap_or("default"));
-    Some(tx)
+    Some(buf)
 }
 
 /// Toggle RTS or DTR line on a serial port for hardware PTT
@@ -524,13 +514,8 @@ impl TxEngine {
         });
 
         // ── Windows: persistent output stream ────────────────────────────────
-        // On Windows WASAPI, opening/closing the output stream each TX produces
-        // timing glitches and unreliable durations. Keep the stream open for the
-        // session lifetime and just feed waveform data when transmitting — WASAPI
-        // fills with silence automatically when the buffer empties.
-        // macOS/Linux: open/close each TX as before.
         #[cfg(target_os = "windows")]
-        let win_audio_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>> = {
+        let win_audio_buf: Option<std::sync::Arc<std::sync::Mutex<Vec<f32>>>> = {
             open_persistent_output_stream(self.output_device.clone())
         };
 
@@ -712,13 +697,19 @@ impl TxEngine {
             let _ = self.hamlib_update_tx.send(HamlibUpdate { freq: None, connected: None, transmitting: true });
 
             let duration_ms = waveform.len() as u64 * 1000 / SAMPLE_RATE as u64;
+            #[allow(unused_variables)]
             let wait_ms = duration_ms + 500;
 
             // Play audio — Windows uses persistent stream to avoid WASAPI timing issues
             #[cfg(target_os = "windows")]
             {
-                if let Some(ref audio_tx) = win_audio_tx {
-                    let _ = audio_tx.send(waveform);
+                if let Some(ref audio_buf) = win_audio_buf {
+                    {
+                        let mut b = audio_buf.lock().unwrap();
+                        b.extend_from_slice(&waveform);
+                    }
+                    log::info!("[TX] Windows: pushed {} samples to persistent stream, sleeping {}ms",
+                        waveform.len(), wait_ms);
                     tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms)).await;
                 } else {
                     // Fallback if persistent stream failed to open

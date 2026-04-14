@@ -2644,6 +2644,7 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
 
     let mut frag_acc = FragmentAccumulator::new();
     let mut current_slot_idx: i64 = -1;
+    let mut accum_best_score: u8 = 0;  // highest validity seen from accumulator this slot
     // Analysis ring buffer: rolling 30s of soft-bit data, written on demand
     const RING_MAX: usize = 300; // ~300 pings max in 30s
     let mut analysis_ring: std::collections::VecDeque<AnalysisPing> = std::collections::VecDeque::with_capacity(RING_MAX);
@@ -2697,6 +2698,7 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
             if settings.clear_accumulator {
                 frag_acc.clear();
                 frag_acc.clear_constraint();
+                accum_best_score = 0;
                 log::info!("[ACCUM] Cleared between QSOs");
             }
 
@@ -2740,6 +2742,7 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
             was_transmitting = true;
             frag_acc.prune_older_than(300); // housekeeping during TX
             frag_acc.clear();
+            accum_best_score = 0;
             while ping_rx.try_recv().is_ok() {}
             continue;
         }
@@ -2753,11 +2756,19 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
             if n > 0 {
                 log::info!("[ACCUM] Slot boundary — processing {} cross-slot fragments", n);
                 for acc in frag_acc.process() {
+                    // Use mean_conf as quality proxy — freeze accumulator once
+                    // we have a high-confidence decode (conf >= 0.70)
+                    let score: u8 = if acc.mean_conf >= 0.70 { 60 } else { 0 };
+                    if score > accum_best_score {
+                        accum_best_score = score;
+                    }
                     let _ = event_tx.send(EngineEvent::Accumulated(acc));
                 }
                 // Don't clear — keep accumulating cross-slot
                 // Prune fragments older than 5 minutes
                 frag_acc.prune_older_than(300);
+                // Reset freeze for next slot
+                accum_best_score = 0;
             }
         }
         current_slot_idx = slot_idx;
@@ -2848,11 +2859,12 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
 
         // ── Accumulator feed — intentionally BEFORE display gate ────────────
         // Feed any ping with conf above noise_mean + 2σ regardless of CCF.
-        // This is below the display threshold but above random noise — captures
-        // real weak energy that the accumulator can integrate across multiple pings.
+        // Stop feeding once a good decode has been achieved (validity >= 60)
+        // to prevent noise fragments from corrupting a settled accumulation.
         let accum_gate_conf = (noise_mean + 2.0 * noise_var.sqrt()).max(0.40);
         let accum_gate = conf >= accum_gate_conf
-            && result.raw_decode.trim().len() >= 2;
+            && result.raw_decode.trim().len() >= 2
+            && accum_best_score < 60;  // freeze once good decode seen
         if accum_gate {
             if let Some(frag) = Fragment::from_result(&result, ping.ccf_ratio) {
                 frag_acc.add(frag);
