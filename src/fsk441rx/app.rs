@@ -291,7 +291,7 @@ impl Default for Settings {
             k_sigma:        5.0,    // μ + 5σ default
             clear_accumulator: false,
             their_df_hz: None,
-            tx_level:       0.1,
+            tx_level:       0.02,
             ant_bw_horiz:   40.0,
             ant_bw_vert:    40.0,
             save_max_data:  false,
@@ -971,7 +971,7 @@ impl Fsk441App {
                         self.qso_log.push(format!("AUTO: {}", msg));
                         if let Some(tx_msg) = self.qso.tx_message() {
                             let dev = self.settings.audio_out();
-                            let _ = self.tx_cmd_tx.send(TxCommand::Transmit { message: tx_msg, output_device: dev });
+                            let _ = self.tx_cmd_tx.send(TxCommand::Transmit { message: tx_msg, output_device: dev, volume: self.settings.tx_level });
                         }
                     }
                     Transition::Complete => {
@@ -1061,6 +1061,7 @@ impl Fsk441App {
         let _ = self.tx_cmd_tx.send(TxCommand::Transmit {
             message: msg.to_string(),
             output_device: dev,
+            volume: self.settings.tx_level,
         });
         self.is_transmitting = true;
         // tx_active is controlled solely by hamlib PTT events — do NOT set here
@@ -2667,8 +2668,8 @@ impl eframe::App for Fsk441App {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         ui.label("TX Level:");
-                        ui.add(egui::Slider::new(&mut self.settings.tx_level, 0.0..=1.0)
-                            .custom_formatter(|v, _| format!("{}%", (v * 100.0).round() as i32)));
+                        ui.add(egui::Slider::new(&mut self.settings.tx_level, 0.0..=0.05)
+                            .custom_formatter(|v, _| format!("{:.1}%", v * 100.0)));
                     });
 
                     // ── Filtering ─────────────────────────────────────────
@@ -2766,12 +2767,31 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
     tokio::spawn(async move {
         let mut planner = rustfft::FftPlanner::<f32>::new();
         let mut _chunk_count = 0u64;
+        let mut rms_acc = 0.0f32;
+        let mut rms_count = 0u32;
+        const LOG_EVERY: u32 = 54; // ~5 seconds at 93ms/chunk
         while let Some(chunk) = audio_spec_rx.recv().await {
             // Every audio chunk = one column — 1024/11025 = ~93ms per column
             let rms = {
                 let sum: f32 = chunk.iter().map(|&s| s * s).sum();
                 (sum / chunk.len() as f32).sqrt()
             };
+            // Accumulate for periodic level logging
+            rms_acc   += rms * rms;
+            rms_count += 1;
+            if rms_count >= LOG_EVERY {
+                let avg_rms  = (rms_acc / rms_count as f32).sqrt();
+                let dbfs     = if avg_rms > 1e-9 { 20.0 * avg_rms.log10() } else { -999.0 };
+                let is_tx    = tx_active_spec.load(std::sync::atomic::Ordering::Relaxed);
+                log::info!(
+                    "[AUDIO_LEVEL] {} input RMS={:.4} ({:.1}dBFS)  [{}]",
+                    chrono::Utc::now().format("%H:%M:%S"),
+                    avg_rms, dbfs,
+                    if is_tx { "TX — audio gated" } else { "RX" }
+                );
+                rms_acc   = 0.0;
+                rms_count = 0;
+            }
             let bins = compute_column(&chunk, &mut planner);
             let _ = spec_tx2.send(EngineEvent::Spectrum(bins, rms));
         }
@@ -3240,7 +3260,7 @@ fn load_config() -> Settings {
             "max_km"         => s.max_km    = v.parse().unwrap_or(3000.0),
             "min_ccf"        => s.min_ccf   = v.parse().unwrap_or(200.0),  // legacy
             "min_conf"       => {}  // legacy — removed; EMA derives threshold automatically
-            "tx_level"       => s.tx_level  = v.parse().unwrap_or(0.1),
+            "tx_level"       => s.tx_level  = v.parse().unwrap_or(0.02),
             "ant_bw_horiz"   => s.ant_bw_horiz = v.parse().unwrap_or(40.0),
             "ant_bw_vert"    => s.ant_bw_vert   = v.parse().unwrap_or(40.0),
             "k_sigma"        => s.k_sigma       = v.parse().unwrap_or(5.0),

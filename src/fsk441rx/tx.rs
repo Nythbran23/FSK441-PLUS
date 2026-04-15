@@ -509,9 +509,9 @@ impl PttMethod {
 
 #[derive(Debug, Clone)]
 pub enum TxCommand {
-    Transmit      { message: String, output_device: Option<String> },
+    Transmit      { message: String, output_device: Option<String>, volume: f32 },
     #[allow(dead_code)]
-    TransmitN     { message: String, times: u8, output_device: Option<String> },
+    TransmitN     { message: String, times: u8, output_device: Option<String>, volume: f32 },
     Halt,
     SetPeriod     (Period),
     SetOutputDevice(Option<String>),
@@ -796,19 +796,19 @@ impl TxEngine {
             }
 
             // Nothing to transmit
-            let (message, dev) = match &current {
+            let (message, dev, volume) = match &current {
                 None => {
                     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                     continue;
                 }
-                Some(TxCommand::Transmit { message, output_device }) =>
-                    (message.clone(), output_device.clone()),
-                Some(TxCommand::TransmitN { message, times, output_device }) => {
+                Some(TxCommand::Transmit { message, output_device, volume }) =>
+                    (message.clone(), output_device.clone(), *volume),
+                Some(TxCommand::TransmitN { message, times, output_device, volume }) => {
                     if tx_count >= *times {
                         current = None; tx_count = 0;
                         continue;
                     }
-                    (message.clone(), output_device.clone())
+                    (message.clone(), output_device.clone(), *volume)
                 }
                 Some(TxCommand::Halt) => {
                     current = None; tx_count = 0;
@@ -857,6 +857,23 @@ impl TxEngine {
             let mut waveform: Vec<f32> = Vec::with_capacity(slot_samples);
             for _ in 0..repeats { waveform.extend_from_slice(&one_msg); }
             waveform.truncate(slot_samples);
+            // Apply TX level — scale samples by operator-configured amplitude (0.0–1.0)
+            if (volume - 1.0f32).abs() > 1e-4 {
+                for s in &mut waveform { *s *= volume; }
+            }
+
+            // ── TX level diagnostics ──────────────────────────────────────────
+            let rms_out = {
+                let sum: f32 = waveform.iter().map(|&s| s * s).sum();
+                (sum / waveform.len() as f32).sqrt()
+            };
+            let peak_out = waveform.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+            let rms_dbfs  = if rms_out  > 1e-9 { 20.0 * rms_out.log10()  } else { -999.0 };
+            let peak_dbfs = if peak_out > 1e-9 { 20.0 * peak_out.log10() } else { -999.0 };
+            log::info!(
+                "[TX_LEVEL] volume={:.4} ({:.1}%)  rms={:.1}dBFS  peak={:.1}dBFS  samples={}",
+                volume, volume * 100.0, rms_dbfs, peak_dbfs, waveform.len()
+            );
 
             log::info!("[TX] Waveform: {} samples ({:.1}s), {} reps of {}ms",
                 waveform.len(), waveform.len() as f32 / SAMPLE_RATE_F,
