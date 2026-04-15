@@ -25,9 +25,22 @@ pub type AudioChunk = Vec<f32>;
 
 // ─── Live capture ─────────────────────────────────────────────────────────────
 
+/// Start live audio capture.
+/// Returns a stop handle — on Linux, send () to release the ALSA device before TX.
+/// On macOS/Windows, the handle is a no-op (dropping it is harmless).
 pub async fn start_live(
     device_name: Option<String>,
     tx: tokio::sync::mpsc::UnboundedSender<Vec<f32>>,
+) -> anyhow::Result<std::sync::mpsc::SyncSender<()>> {
+    let (stop_tx, stop_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    start_live_inner(device_name, tx, stop_rx).await?;
+    Ok(stop_tx)
+}
+
+async fn start_live_inner(
+    device_name: Option<String>,
+    tx: tokio::sync::mpsc::UnboundedSender<Vec<f32>>,
+    stop_rx: std::sync::mpsc::Receiver<()>,
 ) -> anyhow::Result<()> {
 
     let device = if let Some(ref name) = device_name {
@@ -99,7 +112,12 @@ pub async fn start_live(
             .name("fsk441-audio-in".into())
             .spawn(move || {
                 let _h = holder; // keeps stream alive until thread exits
-                loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
+                // Linux: block until stop signal received, then exit to release ALSA handle
+                #[cfg(target_os = "linux")]
+                { let _ = stop_rx.recv(); log::info!("[AUDIO] Linux: input stream released"); }
+                // macOS/Windows: park forever — stop_rx dropped silently
+                #[cfg(not(target_os = "linux"))]
+                { let _ = stop_rx; loop { std::thread::sleep(std::time::Duration::from_secs(3600)); } }
             })
             .ok();
         return Ok(());

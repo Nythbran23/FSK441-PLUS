@@ -777,7 +777,26 @@ impl Fsk441App {
                 }
                 EngineEvent::SecondPassDecodes(results) => {
                     log::info!("[UI] Second-pass: {} recoveries", results.len());
+                    // Deduplicate by hypothesis — keep only the best (highest n_confirmed)
+                    // result per unique hypothesis string. Multiple pings may confirm the
+                    // same message; showing each one floods the display with identical rows.
+                    let mut best_by_hyp: std::collections::HashMap<String, second_pass::SecondPassResult> =
+                        std::collections::HashMap::new();
                     for r in results {
+                        let entry = best_by_hyp.entry(r.hypothesis.clone()).or_insert_with(|| r.clone());
+                        if r.n_confirmed > entry.n_confirmed
+                            || (r.n_confirmed == entry.n_confirmed && r.mean_confidence > entry.mean_confidence)
+                        {
+                            *entry = r;
+                        }
+                    }
+                    // Sort for stable insertion order: most confirmed first
+                    let mut deduped: Vec<second_pass::SecondPassResult> =
+                        best_by_hyp.into_values().collect();
+                    deduped.sort_by(|a, b| b.n_confirmed.cmp(&a.n_confirmed)
+                        .then(b.mean_confidence.partial_cmp(&a.mean_confidence).unwrap()));
+
+                    for r in deduped {
                         let ts = chrono::DateTime::parse_from_rfc3339(&r.detected_at)
                             .map(|dt| dt.with_timezone(&chrono::Utc))
                             .unwrap_or_else(|_| chrono::Utc::now());
@@ -790,7 +809,9 @@ impl Fsk441App {
                                     conf_iter.next(); true
                                 } else { false }
                             } else { false };
-                            second_pass_chars.push((hc, confirmed));
+                            // Show confirmed chars; replace unconfirmed with space
+                            let display_ch = if confirmed { hc } else { ' ' };
+                            second_pass_chars.push((display_ch, confirmed));
                         }
                         let entry = DecodeEntry {
                             timestamp: ts, df_hz: r.df_hz, ccf_ratio: r.ccf_ratio,
@@ -1508,6 +1529,109 @@ impl eframe::App for Fsk441App {
                             }
                         }
                     }
+                    // LOG QSO — right-justified, appears when report received
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let can_log = !self.their_call_edit.trim().is_empty()
+                            && self.qso_time_on.is_some()
+                            && !self.qso_logged;
+                        let rpt_valid = {
+                            let raw = self.report_rcvd.trim().to_uppercase();
+                            let r = raw.trim_start_matches('R').trim();
+                            r.len() == 2 && r.chars().all(|c| c.is_ascii_digit())
+                                && r.parse::<u8>().map(|n| n >= 26 && n <= 59).unwrap_or(false)
+                        };
+                        if self.qso_logged {
+                            ui.label(egui::RichText::new("✓ Logged")
+                                .color(egui::Color32::from_rgb(80, 180, 80)).strong());
+                        } else if can_log {
+                            let btn_color = if rpt_valid {
+                                egui::Color32::from_rgb(50, 200, 80)
+                            } else {
+                                egui::Color32::from_gray(170)
+                            };
+                            let btn = ui.add_enabled(
+                                rpt_valid,
+                                egui::Button::new(
+                                    egui::RichText::new("📋 LOG QSO").color(btn_color).strong()
+                                )
+                            ).on_hover_text(if rpt_valid {
+                                "Write QSO to ~/.fsk441/fsk441.adi"
+                            } else {
+                                "Enter received report (26-59) before logging"
+                            });
+                            if btn.clicked() {
+                                // Inline log — duplicate of the full handler below
+                                // to keep button in the right place
+                                let now      = chrono::Utc::now();
+                                let time_on  = self.qso_time_on.unwrap_or(now);
+                                let callsign = self.their_call_edit.trim().to_uppercase();
+                                let grid = {
+                                    let from_edit = self.their_loc_edit.trim().to_uppercase();
+                                    if !from_edit.is_empty() { from_edit }
+                                    else {
+                                        self.decodes.iter()
+                                            .filter(|e| e.callsigns.iter().any(|c| c.contains(&callsign)))
+                                            .filter_map(|e| e.locator.clone())
+                                            .next().unwrap_or_default()
+                                    }
+                                };
+                                let my_grid = {
+                                    let loc = self.settings.my_loc.trim().to_uppercase();
+                                    if loc.len() >= 4 { loc } else { format!("{}KM", loc) }
+                                };
+                                let rst_s = self.report_sent.trim().to_string();
+                                let rst_r = {
+                                    let r = self.report_rcvd.trim().to_uppercase();
+                                    let r = r.trim_start_matches('R').trim().to_string();
+                                    let valid = r.len() == 2
+                                        && r.chars().all(|c| c.is_ascii_digit())
+                                        && r.parse::<u8>().map(|n| n >= 26 && n <= 59).unwrap_or(false);
+                                    if valid { r } else { String::new() }
+                                };
+                                let freq_mhz = self.rig_freq_hz.map(|h| h as f64 / 1_000_000.0);
+                                let n_pings = self.decodes.iter()
+                                    .filter(|e| e.callsigns.iter().any(|c| c.contains(&callsign)))
+                                    .count() as u32;
+                                let peak_ccf = self.decodes.iter()
+                                    .filter(|e| e.callsigns.iter().any(|c| c.contains(&callsign)))
+                                    .map(|e| e.ccf_ratio as u64).max().unwrap_or(0);
+                                let rec = QsoRecord {
+                                    station_callsign: self.settings.my_call.trim().to_uppercase(),
+                                    callsign: callsign.clone(),
+                                    qso_date: time_on.format("%Y%m%d").to_string(),
+                                    time_on:  time_on.format("%H%M%S").to_string(),
+                                    time_off: now.format("%H%M%S").to_string(),
+                                    band: "2M".to_string(),
+                                    freq_mhz,
+                                    mode: "FSK441".to_string(),
+                                    rst_sent: rst_s.clone(),
+                                    rst_rcvd: rst_r.clone(),
+                                    gridsquare: grid,
+                                    my_gridsquare: my_grid,
+                                    prop_mode: "MS".to_string(),
+                                    nr_pings: n_pings,
+                                    peak_ccf,
+                                    comment: format!("FSK441+ peak CCF={}", peak_ccf),
+                                };
+                                match self.adif_logger.append(&rec) {
+                                    Ok(()) => {
+                                        self.adif_log.push(rec);
+                                        self.qso_logged = true;
+                                        self.qso_log.push(format!(
+                                            "✓ LOGGED: {} S:{} R:{} → fsk441.adi",
+                                            callsign, rst_s, rst_r));
+                                    }
+                                    Err(e) => { self.qso_log.push(format!("✗ Log failed: {}", e)); }
+                                }
+                                self.qso_time_on = None;
+                                self.qso = QsoState::Idle;
+                                self.settings.clear_accumulator = true;
+                                let _ = self.settings_watch_tx.send(self.settings.clone());
+                                self.settings.clear_accumulator = false;
+                                self.decodes.retain(|e| !e.is_accumulated);
+                            }
+                        }
+                    });
                 }
             });
 
@@ -1652,6 +1776,9 @@ impl eframe::App for Fsk441App {
                         if k_resp.changed() {
                             let _ = self.settings_watch_tx.send(self.settings.clone());
                         }
+                        if k_resp.drag_released() {
+                            save_config(&self.settings);
+                        }
                         ui.separator();
                         ui.label(egui::RichText::new("NF floor").color(egui::Color32::from_gray(200)).monospace())
                             .on_hover_text("Minimum conf gate floor\n0.62 = theoretical FSK441 limit\nLower = catches weak fragments for accumulator\nDefault 0.58");
@@ -1661,154 +1788,11 @@ impl eframe::App for Fsk441App {
                         if nf_resp.changed() {
                             let _ = self.settings_watch_tx.send(self.settings.clone());
                         }
+                        if nf_resp.drag_released() {
+                            save_config(&self.settings);
+                        }
                     });
-                    // LOG QSO button — state machine:
-                    //   can_log: call+time present, not yet logged
-                    //   qso_logged: show greyed "✓ Logged" briefly, then hide
-                    let can_log = !self.their_call_edit.trim().is_empty()
-                        && (self.qso_time_on.is_some()
-                            || matches!(&self.qso, QsoState::Complete { .. }))
-                        && !self.qso_logged;
-
-                    // Validate received report — strip R prefix, must be 26-59
-                    let rpt_valid = {
-                        let raw = self.report_rcvd.trim().to_uppercase();
-                        let r = raw.trim_start_matches('R').trim();
-                        r.len() == 2 && r.chars().all(|c| c.is_ascii_digit())
-                            && r.parse::<u8>().map(|n| n >= 26 && n <= 59).unwrap_or(false)
-                    };
-
-                    if self.qso_logged {
-                        // Show confirmation + export button
-                        ui.label(egui::RichText::new("✓ Logged")
-                            .color(egui::Color32::from_rgb(80, 180, 80))
-                            .strong());
-                        if let Some(rec) = self.adif_log.last() {
-                            let rec = rec.clone();
-                            if ui.button(egui::RichText::new("📄 Export")
-                                .color(egui::Color32::from_gray(180)))
-                                .on_hover_text("Copy QSO transcript to clipboard").clicked()
-                            {
-                                let transcript = self.export_qso_transcript(&rec);
-                                // Write to file
-                                let mut path = dirs::home_dir().unwrap_or_default();
-                                path.push(".fsk441");
-                                path.push("transcripts");
-                                let _ = std::fs::create_dir_all(&path);
-                                let fname = format!("{}_{}.txt", rec.qso_date, rec.callsign);
-                                path.push(&fname);
-                                let _ = std::fs::write(&path, &transcript);
-                                // Also copy to clipboard
-                                ui.output_mut(|o| o.copied_text = transcript);
-                                self.qso_log.push(format!("📄 Transcript copied + saved: {}", fname));
-                            }
-                        }
-                    } else if can_log {
-                        if !rpt_valid {
-                            // Report missing/invalid — show inline edit + log button
-                            ui.label(egui::RichText::new("Rpt Rcvd:")
-                                .color(egui::Color32::from_rgb(255, 180, 50)));
-                            ui.add(egui::TextEdit::singleline(&mut self.report_rcvd)
-                                .desired_width(38.0)
-                                .hint_text("26-59")
-                                .font(egui::TextStyle::Monospace));
-                        }
-                        let btn_color = if rpt_valid {
-                            egui::Color32::from_rgb(50, 200, 80)
-                        } else {
-                            egui::Color32::from_gray(170)
-                        };
-                        let btn = ui.add_enabled(
-                            rpt_valid,
-                            egui::Button::new(
-                                egui::RichText::new("📋 LOG QSO").color(btn_color).strong()
-                            )
-                        ).on_hover_text(if rpt_valid {
-                            "Write QSO to ~/.fsk441/fsk441.adi"
-                        } else {
-                            "Enter received report (26-59) before logging"
-                        });
-                        if btn.clicked() {
-                            let now      = chrono::Utc::now();
-                            let time_on  = self.qso_time_on.unwrap_or(now);
-                            let callsign = self.their_call_edit.trim().to_uppercase();
-                            // Their grid: use edit field, or scan decode list for a locator
-                            let grid = {
-                                let from_edit = self.their_loc_edit.trim().to_uppercase();
-                                if !from_edit.is_empty() {
-                                    from_edit
-                                } else {
-                                    // Try to find a locator from decoded pings containing their call
-                                    self.decodes.iter()
-                                        .filter(|e| e.callsigns.iter().any(|c| c.contains(&callsign)))
-                                        .filter_map(|e| e.locator.clone())
-                                        .next()
-                                        .unwrap_or_default()
-                                }
-                            };
-                            // My grid: ensure full locator stored (e.g. IO82KM not IO82)
-                            let my_grid = {
-                                let loc = self.settings.my_loc.trim().to_uppercase();
-                                // Pad to at least 4 chars; use as-is if ≥4
-                                if loc.len() >= 4 { loc } else { format!("{}KM", loc) }
-                            };
-                            let rst_s    = self.report_sent.trim().to_string();
-                            // Clean received report — strip R prefix, require 2-digit RST 26-59
-                            let rst_r = {
-                                let r = self.report_rcvd.trim().to_uppercase();
-                                // Strip leading R (e.g. "R28" → "28")
-                                let r = r.trim_start_matches('R').trim().to_string();
-                                let valid = r.len() == 2
-                                    && r.chars().all(|c| c.is_ascii_digit())
-                                    && r.parse::<u8>().map(|n| n >= 26 && n <= 59).unwrap_or(false);
-                                if valid { r } else { String::new() }
-                            };
-                            let freq_mhz = self.rig_freq_hz.map(|h| h as f64 / 1_000_000.0);
-                            let n_pings  = self.decodes.iter()
-                                .filter(|e| e.callsigns.iter().any(|c| c.contains(&callsign)))
-                                .count() as u32;
-                            let peak_ccf = self.decodes.iter()
-                                .filter(|e| e.callsigns.iter().any(|c| c.contains(&callsign)))
-                                .map(|e| e.ccf_ratio as u64).max().unwrap_or(0);
-                            let rec = QsoRecord {
-                                station_callsign: self.settings.my_call.trim().to_uppercase(),
-                                callsign:         callsign.clone(),
-                                qso_date:         time_on.format("%Y%m%d").to_string(),
-                                time_on:          time_on.format("%H%M%S").to_string(),
-                                time_off:         now.format("%H%M%S").to_string(),
-                                band:             "2M".to_string(),
-                                freq_mhz,
-                                mode:             "FSK441".to_string(),
-                                rst_sent:         rst_s.clone(),
-                                rst_rcvd:         rst_r.clone(),
-                                gridsquare:       grid,
-                                my_gridsquare:    my_grid,
-                                prop_mode:        "MS".to_string(),
-                                nr_pings:         n_pings,
-                                peak_ccf,
-                                comment:          format!("FSK441+ peak CCF={}", peak_ccf),
-                            };
-                            match self.adif_logger.append(&rec) {
-                                Ok(()) => {
-                                    self.adif_log.push(rec);
-                                    self.qso_logged = true;
-                                    self.qso_log.push(format!(
-                                        "✓ LOGGED: {} S:{} R:{} → fsk441.adi",
-                                        callsign, rst_s, rst_r));
-                                }
-                                Err(e) => { self.qso_log.push(format!("✗ Log failed: {}", e)); }
-                            }
-                            self.qso_time_on = None;
-                            self.qso = QsoState::Idle;
-                            // Clear accumulator for next station
-                            self.settings.clear_accumulator = true;
-                            let _ = self.settings_watch_tx.send(self.settings.clone());
-                            self.settings.clear_accumulator = false;
-                            self.decodes.retain(|e| !e.is_accumulated);
-                        }
-                    }
                 });
-
                 // ── Last Logged QSO ───────────────────────────────────────
                 ui.add_space(4.0);
                 ui.separator();
@@ -2206,10 +2190,18 @@ impl eframe::App for Fsk441App {
                                     egui::Color32::from_rgba_unmultiplied(255,255,255,18));
                             }
 
-                            // Header in dim grey monospace
-                            ui.label(egui::RichText::new(&header)
-                                .monospace()
-                                .color(egui::Color32::from_gray(170)));
+                            // Header in dim grey monospace (italic cyan for second pass)
+                            let header_rt = if e.is_second_pass {
+                                egui::RichText::new(&header)
+                                    .monospace()
+                                    .italics()
+                                    .color(egui::Color32::from_rgb(80, 200, 220))
+                            } else {
+                                egui::RichText::new(&header)
+                                    .monospace()
+                                    .color(egui::Color32::from_gray(170))
+                            };
+                            ui.label(header_rt);
 
                             // Render only the meaningful portion of the decode:
                             // trim leading/trailing characters below conf_thresh_show.
@@ -2222,6 +2214,21 @@ impl eframe::App for Fsk441App {
 
                             // Find the meaningful span using a higher trim threshold (0.35)
                             // Characters below this are indistinguishable from noise
+                            // Second pass: render hypothesis with confirmed chars bright, unconfirmed dim
+                            if e.is_second_pass {
+                                for (ch, confirmed) in &e.second_pass_chars {
+                                    let col = if *confirmed {
+                                        egui::Color32::from_rgb(80, 220, 240) // bright cyan = confirmed
+                                    } else {
+                                        egui::Color32::from_rgb(40, 120, 140) // dim cyan = unconfirmed
+                                    };
+                                    let rt = egui::RichText::new(ch.to_string())
+                                        .monospace().italics().color(col);
+                                    let rt = if *confirmed { rt.strong() } else { rt };
+                                    ui.label(rt);
+                                }
+                            } else {
+
                             let conf_trim = 0.35f32;
                             let first = chars.iter().enumerate()
                                 .find(|(ci, _)| confs.get(*ci).copied().unwrap_or(0.0) >= conf_trim)
@@ -2251,9 +2258,9 @@ impl eframe::App for Fsk441App {
                                     if e.score >= 80 { (80u8,  255u8,  80u8, true) }
                                     else             { (200u8, 200u8,  60u8, true) }
                                 } else if conf >= conf_thresh_show {
-                                    (140u8, 140u8, 140u8, false)
+                                    (180u8, 180u8, 180u8, false)
                                 } else {
-                                    (70u8, 70u8, 70u8, false)
+                                    (110u8, 110u8, 110u8, false)
                                 };
                                 let rt = egui::RichText::new(ch.to_string())
                                     .monospace()
@@ -2266,6 +2273,8 @@ impl eframe::App for Fsk441App {
                                 ui.label(egui::RichText::new("…").monospace()
                                     .color(egui::Color32::from_gray(170)));
                             }
+
+                            } // end non-second-pass
                         });
 
                         let in_qso = self.settings.their_call_hint.is_some();
@@ -2586,13 +2595,18 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
     ).unwrap_or(0);
 
     // Two channels from audio: one for detector, one for spectrum
-    let (audio_tx,      audio_rx)      = mpsc::unbounded_channel::<Vec<f32>>();
+    let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<f32>>();
     let (audio_spec_tx, mut audio_spec_rx) = mpsc::unbounded_channel::<Vec<f32>>();
     let (ping_tx, mut ping_rx) = mpsc::unbounded_channel::<detector::DetectedPing>();
 
-    if let Err(e) = audio::start_live(settings.audio_in(), audio_tx).await {
-        log::error!("[ENGINE] Audio: {}", e); return;
-    }
+    // Keep a clone of audio_tx for Linux stream restart after TX
+    let audio_tx_for_restart = audio_tx.clone();
+    let audio_input_device   = settings.audio_in();
+
+    let mut audio_stop_handle = match audio::start_live(settings.audio_in(), audio_tx).await {
+        Ok(h) => h,
+        Err(e) => { log::error!("[ENGINE] Audio: {}", e); return; }
+    };
 
     // Fan out raw audio to detector AND spectrum computer
     let spec_tx2 = event_tx.clone();
@@ -2681,7 +2695,65 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
     const STARTUP_MS: u128 = 3000;
     let mut was_transmitting = false;
 
-    while let Some(ping) = ping_rx.recv().await {
+    loop {
+        // Use a timeout so we wake up periodically during TX even when
+        // the fanout is blanking audio and no pings arrive.
+        let ping = match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            ping_rx.recv()
+        ).await {
+            Ok(Some(p)) => p,
+            Ok(None)    => break, // channel closed
+            Err(_)      => {
+                // Timeout — detect RX→TX slot boundary during audio silence.
+                // Only trigger second pass when in QSO so we don't waste cycles
+                // processing noise on a dead band.
+                let is_tx = tx_active.load(std::sync::atomic::Ordering::Relaxed);
+                let in_qso = settings.their_call_hint.is_some();
+                if is_tx && !was_transmitting && in_qso {
+                    if let Some(ref s) = store {
+                        let entries: Vec<AnalysisPing> = analysis_ring.iter().cloned().collect();
+                        let n = entries.len();
+                        if n > 0 {
+                            match s.save_analysis(&entries) {
+                                Ok(cid) => {
+                                    let _ = event_tx.send(EngineEvent::AnalysisSaved(cid, n));
+                                    log::info!("[2PASS] RX period saved: {} pings capture_id={}", n, cid);
+                                    // Clear ring after save — each capture is THIS RX period only.
+                                    // Without this, every successive save grows the pool with old
+                                    // pings and re-emits identical recoveries every TX slot.
+                                    analysis_ring.clear();
+                                }
+                                Err(e) => log::error!("[DB] 2PASS save failed: {}", e),
+                            }
+                        } else {
+                            log::info!("[2PASS] RX→TX in QSO but ring empty");
+                        }
+                    }
+                }
+                if is_tx { was_transmitting = true; } else { was_transmitting = false; }
+                // Linux half-duplex: release input stream at TX start so TxEngine
+                // can open the same ALSA device for output. Restart after TX ends.
+                #[cfg(target_os = "linux")]
+                if is_tx && !was_transmitting {
+                    log::info!("[AUDIO] Linux: stopping input stream for TX");
+                    let _ = audio_stop_handle.send(());
+                }
+                #[cfg(target_os = "linux")]
+                if !is_tx && was_transmitting {
+                    // 500ms settling delay — ALSA needs time after TX output closes
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    match audio::start_live(audio_input_device.clone(), audio_tx_for_restart.clone()).await {
+                        Ok(h) => {
+                            audio_stop_handle = h;
+                            log::info!("[AUDIO] Linux: input stream restarted after TX");
+                        }
+                        Err(e) => log::error!("[AUDIO] Linux: restart failed: {}", e),
+                    }
+                }
+                continue;
+            }
+        };
         let is_tx = tx_active.load(std::sync::atomic::Ordering::Relaxed);
 
         // Pull latest settings if changed (their_call_hint, period, etc.)
@@ -2731,27 +2803,10 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
             }
         }
 
-        // Drain any pings that queued during TX — they are our own audio.
-        // On the first TX frame, auto-save the ring buffer for second-pass scoring.
+        // Drain any pings that arrived during TX — they are our own audio.
         if is_tx {
-            // Auto-save ring buffer on TX→RX transition detection (first is_tx frame)
-            if !was_transmitting {
-                if let Some(ref s) = store {
-                    let entries: Vec<AnalysisPing> = analysis_ring.iter().cloned().collect();
-                    let n = entries.len();
-                    if n > 0 {
-                        match s.save_analysis(&entries) {
-                            Ok(cid) => {
-                                let _ = event_tx.send(EngineEvent::AnalysisSaved(cid, n));
-                                log::info!("[2PASS] Auto-saved {} pings as capture_id={} at TX start", n, cid);
-                            }
-                            Err(e) => log::error!("[DB] Auto-save on TX start failed: {}", e),
-                        }
-                    }
-                }
-            }
             was_transmitting = true;
-            frag_acc.prune_older_than(300); // housekeeping during TX
+            frag_acc.prune_older_than(300);
             frag_acc.clear();
             accum_best_score = 0;
             while ping_rx.try_recv().is_ok() {}
@@ -2904,8 +2959,15 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
         // RAW mode = MSHV-equivalent: show what WSJT would show
         // Normal mode = our pipeline
         // In both cases threshold_pass drives colour coding
-        // Add to analysis ring buffer — captures pings near threshold for second-pass
-        if conf >= accum_gate_conf && !result.char_probs.is_empty() {
+        // Add to analysis ring buffer — captures pings near threshold for second-pass.
+        // Capture gate is deliberately LOWER than the display gate: we want to catch
+        // pings that just miss the display cut but still carry char_probs energy.
+        // Use K-1.5σ (min 0.5σ) so the ring gate tracks the user's K slider
+        // automatically — no separate control needed.
+        let noise_sigma_now = noise_var.sqrt();
+        let capture_k = (settings.k_sigma - 1.5_f32).max(0.5);
+        let capture_gate_conf = (noise_mean + capture_k * noise_sigma_now).max(0.40);
+        if conf >= capture_gate_conf && !result.char_probs.is_empty() {
             let ap = AnalysisPing {
                 detected_at:     ping.timestamp.to_rfc3339(),
                 df_hz:           ping.df_hz,
@@ -3042,10 +3104,10 @@ fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info")
     ).init();
-    eframe::run_native("FSK441 PLUS",
+    eframe::run_native(&format!("FSK441 PLUS v{}", env!("CARGO_PKG_VERSION")),
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_inner_size([1100.0, 1000.0])
+                .with_inner_size([1100.0, 700.0])
                 .with_min_inner_size([800.0, 520.0]),
             ..Default::default()
         },
