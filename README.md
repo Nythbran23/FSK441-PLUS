@@ -4,7 +4,7 @@ High-performance FSK441 meteor scatter transceiver for macOS, Linux and Windows.
 
 Developed by Roger Banks GW4WND / The DX Shop
 
-![FSK441plus Screenshot]()
+![FSK441plus Screenshot](Screenshot.png)
 
 ## Features
 
