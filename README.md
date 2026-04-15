@@ -84,4 +84,4 @@ All data stored in `~/.fsk441/` (macOS/Linux) or `C:\Users\<n>\.fsk441\` (Window
 
 ## License
 
-MIT — © 2026 Roger Banks GW4WND / The DX Shop
+MIT — © 2026 Roger Banks GW4WND
