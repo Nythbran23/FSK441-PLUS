@@ -79,17 +79,6 @@ All data stored in `~/.fsk441/` (macOS/Linux) or `C:\Users\<n>\.fsk441\` (Window
 | `fsk441.cfg` | Settings |
 | `transcripts/` | QSO transcript exports |
 
-## GitHub Actions secrets required for notarized macOS builds
-
-| Secret | Description |
-|--------|-------------|
-| `MACOS_CERTIFICATE` | Base64-encoded Developer ID certificate (.p12) |
-| `MACOS_CERTIFICATE_PWD` | Certificate password |
-| `KEYCHAIN_PASSWORD` | Temporary keychain password |
-| `MACOS_IDENTITY` | Signing identity string |
-| `APPLE_ID` | Apple ID for notarization |
-| `APPLE_PASSWORD` | App-specific password |
-| `APPLE_TEAM_ID` | Apple Developer Team ID |
 
 ## License
 
