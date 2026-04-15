@@ -183,17 +183,12 @@ pub fn generate_hypotheses(ctx: &QsoContext) -> Vec<String> {
                     h.push(format!("{} {} ", my, their));
                 }
 
-                // We sent TX2 (report) — expect their R+report or RRR
+                // We sent TX2 (report) — expect their R+report or RRR.
+                // Their report is independent of ours — cover all standard values.
                 QsoStage::SentReport => {
-                    // R+report: confirming they received our report
                     for rpt in REPORTS {
                         h.push(format!("{} {} R{} ", my, their, rpt));
-                        h.push(format!("R{} {} {} R{} ", rpt, my, their, rpt));
-                    }
-                    // If we know what report we sent, more specific hypotheses
-                    if let Some(sent) = &ctx.report_sent {
-                        h.push(format!("{} {} R{} ", my, their, sent));
-                        h.push(format!("R{} R{} {} ", sent, sent, my));
+                        h.push(format!("{} {} R{} ", their, my, rpt));
                     }
                     // RRR variants — they might go straight to roger
                     h.push(format!("{} RRRR RRRR {} RRRR ", my, their));
@@ -525,9 +520,12 @@ mod tests {
             noise_floor: 0.557,
         };
         let h = generate_hypotheses(&ctx);
-        // Should include R26 response hypothesis
+        // R26 must appear — it's in REPORTS, covered regardless of what report_sent is
         assert!(h.iter().any(|s| s.contains("R26")),
             "Expected R26 hypothesis, got: {:?}", h);
+        // R28 must also appear — their report is independent of ours
+        assert!(h.iter().any(|s| s.contains("R28")),
+            "Expected R28 hypothesis (their report independent of ours), got: {:?}", h);
     }
 
     #[test]
