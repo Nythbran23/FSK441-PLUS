@@ -225,6 +225,19 @@ fn default_cty_path() -> String {
     "cty.dat".into()
 }
 
+/// PTT keying method — how the transmitter is keyed during TX
+#[derive(Clone, PartialEq, Debug)]
+pub enum PttMethod {
+    HamlibCat,   // PTT via CAT command through hamlib (existing behaviour)
+    Rts,          // Assert RTS on ptt_serial_port
+    Dtr,          // Assert DTR on ptt_serial_port
+    VoxOnly,      // No software PTT — rely on VOX or manual keying
+}
+
+impl Default for PttMethod {
+    fn default() -> Self { PttMethod::HamlibCat }
+}
+
 // ─── Settings ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -253,6 +266,8 @@ struct Settings {
     ant_bw_vert:    f32,
     save_max_data:  bool,
     qsy_reset:      bool,  // pulse: reset EMA on QSY
+    ptt_method:     PttMethod,
+    ptt_serial_port: String,
 }
 
 impl Default for Settings {
@@ -281,6 +296,8 @@ impl Default for Settings {
             ant_bw_vert:    40.0,
             save_max_data:  false,
             qsy_reset:      false,
+            ptt_method:     PttMethod::HamlibCat,
+            ptt_serial_port: String::new(),
         }
     }
 }
@@ -497,6 +514,7 @@ struct Fsk441App {
     // Second-pass decoder
     event_tx:            mpsc::UnboundedSender<EngineEvent>,
     second_pass_db_path: String,
+    ptt_port:            Option<Box<dyn serialport::SerialPort>>,
 }
 
 impl Fsk441App {
@@ -636,6 +654,59 @@ impl Fsk441App {
             p.push(".fsk441"); p.push("fsk441.db");
             p.to_string_lossy().to_string()
         },
+        ptt_port: None,
+        }
+    }
+
+    /// Open (or reopen) the PTT serial port based on current settings.
+    /// Called when settings change. Safe to call when port is already open — closes first.
+    fn open_ptt_port(&mut self) {
+        self.ptt_port = None; // close existing
+        if matches!(self.settings.ptt_method, PttMethod::Rts | PttMethod::Dtr)
+            && !self.settings.ptt_serial_port.is_empty()
+        {
+            match serialport::new(&self.settings.ptt_serial_port, 9600)
+                .timeout(std::time::Duration::from_millis(100))
+                .open()
+            {
+                Ok(mut port) => {
+                    // Ensure both lines start low (unkeyed)
+                    let _ = port.write_request_to_send(false);
+                    let _ = port.write_data_terminal_ready(false);
+                    self.ptt_port = Some(port);
+                    log::info!("[PTT] Opened serial PTT port: {}", self.settings.ptt_serial_port);
+                }
+                Err(e) => {
+                    log::warn!("[PTT] Failed to open serial PTT port {}: {}",
+                        self.settings.ptt_serial_port, e);
+                }
+            }
+        }
+    }
+
+    /// Assert or deassert PTT on the configured serial pin (RTS or DTR).
+    /// No-op if ptt_method is HamlibCat or VoxOnly.
+    fn set_serial_ptt(&mut self, active: bool) {
+        match self.settings.ptt_method {
+            PttMethod::Rts => {
+                if let Some(ref mut port) = self.ptt_port {
+                    if let Err(e) = port.write_request_to_send(active) {
+                        log::warn!("[PTT] RTS set {} failed: {}", active, e);
+                    } else {
+                        log::info!("[PTT] RTS → {}", if active { "TX" } else { "RX" });
+                    }
+                }
+            }
+            PttMethod::Dtr => {
+                if let Some(ref mut port) = self.ptt_port {
+                    if let Err(e) = port.write_data_terminal_ready(active) {
+                        log::warn!("[PTT] DTR set {} failed: {}", active, e);
+                    } else {
+                        log::info!("[PTT] DTR → {}", if active { "TX" } else { "RX" });
+                    }
+                }
+            }
+            _ => {} // HamlibCat and VoxOnly handled elsewhere
         }
     }
 
@@ -862,6 +933,9 @@ impl Fsk441App {
                     }
                     if upd.transmitting != self.is_transmitting {
                         self.is_transmitting = upd.transmitting;
+                        if !upd.transmitting {
+                            self.set_serial_ptt(false); // belt-and-braces deassert on TX end
+                        }
                         // Only update tx_active from PTT events (freq=None), not freq polls (freq=Some)
                         // This prevents freq polls (which always send transmitting=false) from
                         // incorrectly clearing tx_active during transmission
@@ -982,6 +1056,7 @@ impl Fsk441App {
     }
 
     fn send_tx(&mut self, msg: &str) {
+        self.set_serial_ptt(true);
         let dev = self.settings.audio_out();
         let _ = self.tx_cmd_tx.send(TxCommand::Transmit {
             message: msg.to_string(),
@@ -1145,6 +1220,7 @@ impl Fsk441App {
 
     fn halt_tx(&mut self) {
         log::info!("[APP] HALT from halt_tx()");
+        self.set_serial_ptt(false);
         let _ = self.tx_cmd_tx.send(TxCommand::Halt);
         self.is_transmitting = false;
         // tx_active is now controlled by TxEngine directly — it will set false
@@ -2484,6 +2560,66 @@ impl eframe::App for Fsk441App {
                         });
                     }
 
+                    // ── PTT Control ───────────────────────────────────────
+                    ui.separator();
+                    ui.heading("PTT Control");
+                    egui::Grid::new("ptt_grid").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                        ui.label("PTT Method:");
+                        ui.horizontal(|ui| {
+                            let prev = self.settings.ptt_method.clone();
+                            ui.radio_value(&mut self.settings.ptt_method, PttMethod::HamlibCat, "Hamlib CAT")
+                                .on_hover_text("Key TX via CAT command through hamlib (default)");
+                            ui.radio_value(&mut self.settings.ptt_method, PttMethod::Rts, "RTS")
+                                .on_hover_text("Assert RTS pin on selected serial port to key TX");
+                            ui.radio_value(&mut self.settings.ptt_method, PttMethod::Dtr, "DTR")
+                                .on_hover_text("Assert DTR pin on selected serial port to key TX");
+                            ui.radio_value(&mut self.settings.ptt_method, PttMethod::VoxOnly, "VOX / None")
+                                .on_hover_text("No software PTT — use VOX or key manually");
+                            if self.settings.ptt_method != prev {
+                                self.open_ptt_port();
+                                save_config(&self.settings);
+                            }
+                        });
+                        ui.end_row();
+
+                        if matches!(self.settings.ptt_method, PttMethod::Rts | PttMethod::Dtr) {
+                            ui.label("PTT Port:");
+                            ui.horizontal(|ui| {
+                                let prev_port = self.settings.ptt_serial_port.clone();
+                                let cur_text = if self.settings.ptt_serial_port.is_empty() {
+                                    "Select port...".to_string()
+                                } else {
+                                    self.settings.ptt_serial_port.clone()
+                                };
+                                egui::ComboBox::from_id_salt("ptt_port_sel")
+                                    .selected_text(cur_text)
+                                    .width(220.0)
+                                    .show_ui(ui, |ui| {
+                                        for p in &self.serial_ports.clone() {
+                                            ui.selectable_value(
+                                                &mut self.settings.ptt_serial_port,
+                                                p.clone(), p);
+                                        }
+                                    });
+                                if ui.small_button("🔄").on_hover_text("Refresh port list").clicked() {
+                                    self.serial_ports = enumerate_serial_ports();
+                                }
+                                if self.settings.ptt_serial_port != prev_port {
+                                    self.open_ptt_port();
+                                    save_config(&self.settings);
+                                }
+                                // Status indicator
+                                let (col, label) = if self.ptt_port.is_some() {
+                                    (egui::Color32::from_rgb(0, 200, 80), "● Open")
+                                } else {
+                                    (egui::Color32::from_rgb(180, 40, 40), "● Not open")
+                                };
+                                ui.label(egui::RichText::new(label).color(col).monospace());
+                            });
+                            ui.end_row();
+                        }
+                    });
+
                     // ── Audio Hardware ────────────────────────────────────
                     ui.separator();
                     ui.heading("Audio Hardware");
@@ -2567,6 +2703,7 @@ impl eframe::App for Fsk441App {
                     if ui.button("Save & Close").clicked() {
                         self.settings_open = false;
                         save_config(&self.settings);
+                        self.open_ptt_port();
                         // Apply changes to running TxEngine immediately
                         let _ = self.tx_cmd_tx.send(TxCommand::SetPeriod(self.settings.period));
                         self.period_timer = PeriodTimer::new(self.settings.period);
@@ -3042,8 +3179,14 @@ fn save_config(s: &Settings) {
         Period::TxFirst15  => "first15",
         Period::TxSecond15 => "second15",
     };
+    let ptt_method_str = match s.ptt_method {
+        PttMethod::HamlibCat => "hamlib_cat",
+        PttMethod::Rts       => "rts",
+        PttMethod::Dtr       => "dtr",
+        PttMethod::VoxOnly   => "vox",
+    };
     let data = format!(
-        "my_call={}\nmy_loc={}\ninput={}\noutput={}\nrig_model={}\nrig_port={}\nrig_baud={}\nhamlib_enabled={}\nperiod={}\ncty_path={}\nmax_km={}\nmin_ccf={}\ntx_level={}\nant_bw_horiz={}\nant_bw_vert={}\nk_sigma={}\nsave_max_data={}\n",
+        "my_call={}\nmy_loc={}\ninput={}\noutput={}\nrig_model={}\nrig_port={}\nrig_baud={}\nhamlib_enabled={}\nperiod={}\ncty_path={}\nmax_km={}\nmin_ccf={}\ntx_level={}\nant_bw_horiz={}\nant_bw_vert={}\nk_sigma={}\nsave_max_data={}\nptt_method={}\nptt_serial_port={}\n",
         s.my_call,
         s.my_loc,
         s.sel_in.as_deref().unwrap_or(""),
@@ -3061,6 +3204,8 @@ fn save_config(s: &Settings) {
         s.ant_bw_vert,
         s.k_sigma,
         s.save_max_data,
+        ptt_method_str,
+        s.ptt_serial_port,
     );
     if let Err(e) = std::fs::write(config_path(), data) {
         log::warn!("Failed to save config: {}", e);
@@ -3102,6 +3247,13 @@ fn load_config() -> Settings {
             "arm2_ccf"       => {}  // legacy — silently ignored
             "arm2_conf"      => {}  // legacy — silently ignored
             "save_max_data"  => s.save_max_data  = v == "true",
+            "ptt_method"     => s.ptt_method = match v {
+                "rts"        => PttMethod::Rts,
+                "dtr"        => PttMethod::Dtr,
+                "vox"        => PttMethod::VoxOnly,
+                _            => PttMethod::HamlibCat,
+            },
+            "ptt_serial_port" => s.ptt_serial_port = v.to_string(),
             _ => {}
         }
     }
