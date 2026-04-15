@@ -214,22 +214,14 @@ pub struct DecodeEntry {
 enum EngineEvent { Decode(DecodeEntry), Accumulated(AccumulatedDecode), Hamlib(HamlibUpdate), Spectrum(Vec<f32>, f32), AnalysisSaved(i64, usize), SecondPassDecodes(Vec<second_pass::SecondPassResult>), NoiseStats { mean: f32, sigma: f32, threshold: f32 }, ConfUpdate(f32, bool) }
 
 
-/// Find cty.dat — checks next to binary first, then ~/MSK2Ksoft, then current dir.
+/// Find cty.dat — checks next to binary first, then current working directory.
 fn default_cty_path() -> String {
-    // Next to the running binary
+    // Next to the running binary (covers bundled app and standard install)
     if let Ok(exe) = std::env::current_exe() {
         let p = exe.parent().unwrap_or(std::path::Path::new(".")).join("cty.dat");
         if p.exists() { return p.to_string_lossy().into_owned(); }
     }
-    // ~/MSK2Ksoft/cty.dat (new project root)
-    if let Some(home) = dirs::home_dir() {
-        let p = home.join("MSK2Ksoft").join("cty.dat");
-        if p.exists() { return p.to_string_lossy().into_owned(); }
-        // ~/Desktop/MSK2Ksoft (old location — fallback)
-        let p2 = home.join("Desktop").join("MSK2Ksoft").join("cty.dat");
-        if p2.exists() { return p2.to_string_lossy().into_owned(); }
-    }
-    // Relative fallback
+    // Relative fallback — current working directory
     "cty.dat".into()
 }
 
