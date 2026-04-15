@@ -84,8 +84,8 @@ jobs:
       - name: Import signing certificate
         if: matrix.bundle && startsWith(github.ref, 'refs/tags/')
         env:
-          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
-          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          MACOS_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
           CERTIFICATE_PATH=$RUNNER_TEMP/certificate.p12
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
@@ -259,7 +259,7 @@ jobs:
         if: matrix.bundle && startsWith(github.ref, 'refs/tags/')
         env:
           APPLE_ID:       ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID:  ${{ secrets.APPLE_TEAM_ID }}
         run: |
           IDENTITY=$(security find-identity -v -p codesigning \
