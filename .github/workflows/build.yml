@@ -1,77 +1,356 @@
-name: Build and Release
+name: Build FSK441+
 
 on:
   push:
+    branches: [ main ]
     tags:
       - 'v*'
-  workflow_dispatch:
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
 
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: macos-latest
-            arch: arm64
-            platform: darwin
-          - os: windows-latest
-            arch: x64
-            platform: win32
+            target: aarch64-apple-darwin
+            artifact: fsk441-macos-arm64
+            bundle: true
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: fsk441-macos-x64
+            bundle: true
           - os: ubuntu-latest
-            arch: x64
-            platform: linux
-    
+            target: x86_64-unknown-linux-gnu
+            artifact: fsk441-linux-x64
+            bundle: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: fsk441-windows-x64
+            bundle: false
+
     runs-on: ${{ matrix.os }}
-    
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          node-version: '18'
+          targets: ${{ matrix.target }}
 
-      - name: Install dependencies
-        run: npm install
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libssl-dev \
+            pkg-config \
+            libgtk-3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libglib2.0-dev \
+            libudev-dev
 
-      - name: Build Electron app
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install hamlib
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --bin fsk441plus --release --target ${{ matrix.target }}
+
+      # ── macOS: import certificate ────────────────────────────────────────
+      - name: Import signing certificate
+        if: matrix.bundle && startsWith(github.ref, 'refs/tags/')
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npm run make
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          CERTIFICATE_PATH=$RUNNER_TEMP/certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 12)
 
-      - name: Upload artifacts
+          echo -n "$MACOS_CERTIFICATE" | base64 --decode -o $CERTIFICATE_PATH
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security import $CERTIFICATE_PATH -P "$MACOS_CERTIFICATE_PWD" \
+            -A -k $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security list-keychains -d user -s $KEYCHAIN_PATH
+          security find-identity -v -p codesigning $KEYCHAIN_PATH
+
+      # ── macOS: create app icon ───────────────────────────────────────────
+      - name: Create App Icon
+        if: matrix.bundle
+        run: |
+          if [ -f assets/FSK441PLUS.png ]; then
+            ICONSET="AppIcon.iconset"
+            mkdir -p "$ICONSET"
+            sips -z 16 16     assets/FSK441PLUS.png --out "$ICONSET/icon_16x16.png"
+            sips -z 32 32     assets/FSK441PLUS.png --out "$ICONSET/icon_16x16@2x.png"
+            sips -z 32 32     assets/FSK441PLUS.png --out "$ICONSET/icon_32x32.png"
+            sips -z 64 64     assets/FSK441PLUS.png --out "$ICONSET/icon_32x32@2x.png"
+            sips -z 128 128   assets/FSK441PLUS.png --out "$ICONSET/icon_128x128.png"
+            sips -z 256 256   assets/FSK441PLUS.png --out "$ICONSET/icon_128x128@2x.png"
+            sips -z 256 256   assets/FSK441PLUS.png --out "$ICONSET/icon_256x256.png"
+            sips -z 512 512   assets/FSK441PLUS.png --out "$ICONSET/icon_256x256@2x.png"
+            sips -z 512 512   assets/FSK441PLUS.png --out "$ICONSET/icon_512x512.png"
+            sips -z 1024 1024 assets/FSK441PLUS.png --out "$ICONSET/icon_512x512@2x.png"
+            iconutil -c icns "$ICONSET" -o AppIcon.icns
+            echo "Icon created OK"
+          else
+            echo "No icon at assets/FSK441PLUS.png — skipping"
+          fi
+
+      # ── macOS: create .app bundle ────────────────────────────────────────
+      - name: Create .app bundle
+        if: matrix.bundle
+        run: |
+          APP="FSK441Plus.app"
+          CONTENTS="$APP/Contents"
+          MACOS_DIR="$CONTENTS/MacOS"
+          RESOURCES="$CONTENTS/Resources"
+          FRAMEWORKS="$CONTENTS/Frameworks"
+
+          mkdir -p "$MACOS_DIR/tools" "$RESOURCES" "$FRAMEWORKS"
+
+          cp target/${{ matrix.target }}/release/fsk441plus "$MACOS_DIR/fsk441plus"
+          chmod +x "$MACOS_DIR/fsk441plus"
+
+          [ -f AppIcon.icns ] && cp AppIcon.icns "$RESOURCES/AppIcon.icns"
+
+          # Bundle rigctld
+          cp $(brew --prefix)/bin/rigctld "$MACOS_DIR/tools/rigctld"
+          chmod +x "$MACOS_DIR/tools/rigctld"
+
+          # Bundle libhamlib and libusb
+          HAMLIB_LIB=$(brew --prefix hamlib)/lib
+          LIBUSB_LIB=$(brew --prefix libusb)/lib
+          cp -L "$HAMLIB_LIB/libhamlib.4.dylib"    "$FRAMEWORKS/libhamlib.4.dylib"
+          cp -L "$LIBUSB_LIB/libusb-1.0.0.dylib"   "$FRAMEWORKS/libusb-1.0.0.dylib"
+
+          # Fix library paths
+          install_name_tool -change \
+            "$(otool -L "$MACOS_DIR/tools/rigctld" | grep libhamlib | awk '{print $1}')" \
+            "@loader_path/../../Frameworks/libhamlib.4.dylib" \
+            "$MACOS_DIR/tools/rigctld"
+
+          install_name_tool -change \
+            "$(otool -L "$MACOS_DIR/tools/rigctld" | grep libusb | awk '{print $1}')" \
+            "@loader_path/../../Frameworks/libusb-1.0.0.dylib" \
+            "$MACOS_DIR/tools/rigctld"
+
+          install_name_tool -id "@loader_path/libhamlib.4.dylib" \
+            "$FRAMEWORKS/libhamlib.4.dylib"
+
+          install_name_tool -change \
+            "$(otool -L "$FRAMEWORKS/libhamlib.4.dylib" | grep libusb | awk '{print $1}')" \
+            "@loader_path/libusb-1.0.0.dylib" \
+            "$FRAMEWORKS/libhamlib.4.dylib"
+
+          install_name_tool -id "@loader_path/libusb-1.0.0.dylib" \
+            "$FRAMEWORKS/libusb-1.0.0.dylib"
+
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "Version: $VERSION"
+
+          cat > "$CONTENTS/Info.plist" << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>FSK441Plus</string>
+            <key>CFBundleDisplayName</key><string>FSK441+</string>
+            <key>CFBundleIdentifier</key><string>com.thedxshop.fsk441plus</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleExecutable</key><string>fsk441plus</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>LSMinimumSystemVersion</key><string>12.0</string>
+            <key>NSMicrophoneUsageDescription</key>
+              <string>FSK441+ needs microphone access to receive meteor scatter signals.</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict></plist>
+          PLIST
+
+          echo "=== Bundle contents ==="
+          find "$APP" -type f
+
+      # ── macOS: sign bundle (tag builds only) ─────────────────────────────
+      - name: Sign .app bundle
+        if: matrix.bundle && startsWith(github.ref, 'refs/tags/')
+        run: |
+          IDENTITY=$(security find-identity -v -p codesigning \
+            $RUNNER_TEMP/app-signing.keychain-db \
+            | grep "Developer ID Application" | head -1 \
+            | sed 's/.*"\(.*\)".*/\1/')
+          echo "Signing with: $IDENTITY"
+
+          cat > entitlements.plist << 'ENT'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>com.apple.security.device.audio-input</key><true/>
+          </dict></plist>
+          ENT
+
+          # Sign inside-out: frameworks → rigctld → bundle
+          codesign --force --options runtime --sign "$IDENTITY" --timestamp \
+            FSK441Plus.app/Contents/Frameworks/libusb-1.0.0.dylib
+
+          codesign --force --options runtime --sign "$IDENTITY" --timestamp \
+            FSK441Plus.app/Contents/Frameworks/libhamlib.4.dylib
+
+          codesign --force --options runtime --sign "$IDENTITY" --timestamp \
+            FSK441Plus.app/Contents/MacOS/tools/rigctld
+
+          codesign --force --options runtime --sign "$IDENTITY" --timestamp \
+            --entitlements entitlements.plist \
+            FSK441Plus.app
+
+          codesign --verify --deep --strict --verbose=2 FSK441Plus.app
+          echo "Signature verified OK"
+
+      # ── macOS: create DMG ────────────────────────────────────────────────
+      - name: Create DMG
+        if: matrix.bundle
+        run: |
+          DMG_STAGE="dmg_stage"
+          mkdir -p "$DMG_STAGE"
+          cp -R FSK441Plus.app "$DMG_STAGE/"
+          ln -s /Applications "$DMG_STAGE/Applications"
+
+          hdiutil create -volname "FSK441Plus" \
+            -srcfolder "$DMG_STAGE" \
+            -ov -format UDZO \
+            ${{ matrix.artifact }}.dmg
+
+          echo "DMG created: ${{ matrix.artifact }}.dmg"
+          ls -la ${{ matrix.artifact }}.dmg
+
+      # ── macOS: sign and notarize DMG (tag builds only) ───────────────────
+      - name: Sign and notarize DMG
+        if: matrix.bundle && startsWith(github.ref, 'refs/tags/')
+        env:
+          APPLE_ID:       ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID:  ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          IDENTITY=$(security find-identity -v -p codesigning \
+            $RUNNER_TEMP/app-signing.keychain-db \
+            | grep "Developer ID Application" | head -1 \
+            | sed 's/.*"\(.*\)".*/\1/')
+
+          codesign --force --sign "$IDENTITY" --timestamp \
+            ${{ matrix.artifact }}.dmg
+
+          xcrun notarytool submit ${{ matrix.artifact }}.dmg \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 30m
+
+          xcrun stapler staple ${{ matrix.artifact }}.dmg
+          echo "Notarization and stapling complete"
+
+      # ── Clean up keychain ────────────────────────────────────────────────
+      - name: Clean up keychain
+        if: matrix.bundle && startsWith(github.ref, 'refs/tags/') && always()
+        run: |
+          security delete-keychain $RUNNER_TEMP/app-signing.keychain-db 2>/dev/null || true
+
+      # ── Linux: package ───────────────────────────────────────────────────
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: |
+          cp target/${{ matrix.target }}/release/fsk441plus ${{ matrix.artifact }}
+          chmod +x ${{ matrix.artifact }}
+          tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+
+      # ── Windows: bundle rigctld + DLLs ───────────────────────────────────
+      - name: Download Hamlib (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/Hamlib/Hamlib/releases/download/4.5.5/hamlib-w64-4.5.5.zip" -OutFile "hamlib.zip"
+          Expand-Archive -Path "hamlib.zip" -DestinationPath "hamlib_temp"
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path "release\tools"
+          Copy-Item "target\${{ matrix.target }}\release\fsk441plus.exe"         -Destination "release\"
+          Copy-Item "hamlib_temp\hamlib-w64-4.5.5\bin\rigctld.exe"               -Destination "release\tools\"
+          Copy-Item "hamlib_temp\hamlib-w64-4.5.5\bin\libhamlib-4.dll"           -Destination "release\"
+          Copy-Item "hamlib_temp\hamlib-w64-4.5.5\bin\libhamlib-4.dll"           -Destination "release\tools\"
+          Copy-Item "hamlib_temp\hamlib-w64-4.5.5\bin\libgcc_s_sjlj-1.dll"      -Destination "release\"
+          Copy-Item "hamlib_temp\hamlib-w64-4.5.5\bin\libgcc_s_sjlj-1.dll"      -Destination "release\tools\"
+          Copy-Item "hamlib_temp\hamlib-w64-4.5.5\bin\libusb-1.0.dll"           -Destination "release\"
+          Copy-Item "hamlib_temp\hamlib-w64-4.5.5\bin\libusb-1.0.dll"           -Destination "release\tools\"
+          Copy-Item "hamlib_temp\hamlib-w64-4.5.5\bin\libwinpthread-1.dll"      -Destination "release\"
+          Copy-Item "hamlib_temp\hamlib-w64-4.5.5\bin\libwinpthread-1.dll"      -Destination "release\tools\"
+          Compress-Archive -Path "release\*" -DestinationPath "${{ matrix.artifact }}.zip"
+
+      # ── Upload artifacts ─────────────────────────────────────────────────
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: msk2k-${{ matrix.platform }}-${{ matrix.arch }}
+          name: ${{ matrix.artifact }}
           path: |
-            out/make/**/*.dmg
-            out/make/**/*.zip
-            out/make/**/*.exe
-            out/make/**/*.deb
-            out/make/**/*.rpm
-            out/make/**/*.AppImage
+            ${{ matrix.artifact }}.dmg
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.zip
+          if-no-files-found: ignore
 
+  # ── Create GitHub release on tag push ────────────────────────────────────
   release:
     needs: build
-    runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
-    
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
-        
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
         with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
           files: |
-            **/*.dmg
-            **/*.zip
-            **/*.exe
-            **/*.deb
-            **/*.rpm
-            **/*.AppImage
-          draft: false
-          prerelease: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            artifacts/fsk441-macos-arm64/fsk441-macos-arm64.dmg
+            artifacts/fsk441-macos-x64/fsk441-macos-x64.dmg
+            artifacts/fsk441-linux-x64/fsk441-linux-x64.tar.gz
+            artifacts/fsk441-windows-x64/fsk441-windows-x64.zip
