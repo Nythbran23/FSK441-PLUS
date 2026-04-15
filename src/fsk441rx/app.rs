@@ -211,7 +211,7 @@ pub struct DecodeEntry {
     second_pass_chars: Vec<(char, bool)>,
 }
 
-enum EngineEvent { Decode(DecodeEntry), Accumulated(AccumulatedDecode), Hamlib(HamlibUpdate), Spectrum(Vec<f32>, f32), AnalysisSaved(i64, usize), SecondPassDecodes(Vec<second_pass::SecondPassResult>), NoiseStats { mean: f32, sigma: f32, threshold: f32 }, ConfUpdate(f32) }
+enum EngineEvent { Decode(DecodeEntry), Accumulated(AccumulatedDecode), Hamlib(HamlibUpdate), Spectrum(Vec<f32>, f32), AnalysisSaved(i64, usize), SecondPassDecodes(Vec<second_pass::SecondPassResult>), NoiseStats { mean: f32, sigma: f32, threshold: f32 }, ConfUpdate(f32, bool) }
 
 
 /// Find cty.dat — checks next to binary first, then ~/MSK2Ksoft, then current dir.
@@ -253,7 +253,6 @@ struct Settings {
     max_km:         f64,
     threshold:      f32,
     min_ccf:        f32,   // kept for config backwards compat only
-    min_conf:       f32,   // floor on adaptive threshold during warmup
     k_sigma:        f32,   // sensitivity: threshold = noise_mean + k_sigma * sigma
     clear_accumulator: bool,
     their_df_hz:      Option<f32>,
@@ -268,7 +267,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             my_call:        "NOCALL".into(),
-            my_loc:         "IO82KM".into(),
+            my_loc:         "NOLOC".into(),
             sel_in:         Some("USB Audio CODEC".into()),
             sel_out:        Some("USB Audio CODEC".into()),
             hamlib_enabled: true,
@@ -282,7 +281,6 @@ impl Default for Settings {
             max_km:         3000.0,
             threshold:      3.0,
             min_ccf:        200.0,  // legacy — not used in gate
-            min_conf:       0.58,   // warmup floor
             k_sigma:        5.0,    // μ + 5σ default
             clear_accumulator: false,
             their_df_hz: None,
@@ -503,6 +501,7 @@ struct Fsk441App {
     noise_mean:        f32,   // live noise floor mean conf
     noise_sigma:       f32,   // live noise floor sigma
     adaptive_threshold: f32,  // live adaptive conf threshold
+    nf_settled:         bool, // EMA has converged — NF label goes green
     // Second-pass decoder
     event_tx:            mpsc::UnboundedSender<EngineEvent>,
     second_pass_db_path: String,
@@ -629,7 +628,8 @@ impl Fsk441App {
         adif_log: Vec::new(),
         noise_mean: 0.44,
         noise_sigma: 0.02,
-        adaptive_threshold: 0.58,
+        adaptive_threshold: 0.54, // prior: noise_mean(0.44) + k(5) × noise_sigma(0.02)
+        nf_settled: false,
         wf_amplitude: Vec::new(),
         last_conf: 0.0,
         wf_period_idx: -1,
@@ -727,8 +727,9 @@ impl Fsk441App {
                     self.adaptive_threshold = threshold;
                     continue;
                 }
-                EngineEvent::ConfUpdate(c) => {
+                EngineEvent::ConfUpdate(c, settled) => {
                     self.last_conf = c;
+                    self.nf_settled = settled;
                     continue;
                 }
                 EngineEvent::AnalysisSaved(capture_id, n) => {
@@ -1751,12 +1752,19 @@ impl eframe::App for Fsk441App {
 
                     // NF, conf and k slider — right justified in this row
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let nf_col = if self.nf_settled {
+                            egui::Color32::from_rgb(0, 200, 80)   // green — EMA converged
+                        } else {
+                            egui::Color32::from_rgb(180, 40, 40)  // dull red — still calibrating
+                        };
                         ui.label(egui::RichText::new(format!("NF {:.2}", self.adaptive_threshold))
-                            .color(egui::Color32::WHITE)
+                            .color(nf_col)
                             .monospace())
                             .on_hover_text(format!(
-                                "Adaptive noise floor gate\nμ={:.4}  σ={:.4}\nUpdates every ~5 minutes",
-                                self.noise_mean, self.noise_sigma));
+                                "Adaptive noise floor gate\nμ={:.4}  σ={:.4}\n{}\nGreen = EMA settled  Red = still calibrating",
+                                self.noise_mean, self.noise_sigma,
+                                if self.nf_settled { "EMA converged" } else { "Warming up — needs more pings" }
+                            ));
                         ui.separator();
                         let conf_col = if self.last_conf >= self.adaptive_threshold {
                             egui::Color32::from_rgb(0, 220, 100)
@@ -1769,26 +1777,28 @@ impl eframe::App for Fsk441App {
                             .on_hover_text("Confidence of last decoded ping. Green = above noise gate.");
                         ui.separator();
                         ui.label(egui::RichText::new("k").color(egui::Color32::from_gray(200)).monospace())
-                            .on_hover_text("Signal separation factor: gate = noise_mean + k × sigma\nLower = more sensitive, Higher = more selective");
+                            .on_hover_text(
+                                "Detection sensitivity — sole threshold control.\n\
+                                 Gate = noise_mean + k × sigma\n\
+                                 Noise floor is measured automatically from band conditions.\n\n\
+                                 k=5 (default): good balance for meteor scatter\n\
+                                 Lower k: more sensitive, more noise visible\n\
+                                 Higher k: cleaner display, may miss marginal pings"
+                            );
                         let k_resp = ui.add(egui::Slider::new(&mut self.settings.k_sigma, 2.0..=10.0)
                             .fixed_decimals(1))
-                            .on_hover_text("Signal separation factor: gate = noise_mean + k × sigma\nLower = more sensitive, Higher = more selective");
+                            .on_hover_text(
+                                "Detection sensitivity — sole threshold control.\n\
+                                 Gate = noise_mean + k × sigma\n\
+                                 Noise floor is measured automatically from band conditions.\n\n\
+                                 k=5 (default): good balance for meteor scatter\n\
+                                 Lower k: more sensitive, more noise visible\n\
+                                 Higher k: cleaner display, may miss marginal pings"
+                            );
                         if k_resp.changed() {
                             let _ = self.settings_watch_tx.send(self.settings.clone());
                         }
                         if k_resp.drag_released() {
-                            save_config(&self.settings);
-                        }
-                        ui.separator();
-                        ui.label(egui::RichText::new("NF floor").color(egui::Color32::from_gray(200)).monospace())
-                            .on_hover_text("Minimum conf gate floor\n0.62 = theoretical FSK441 limit\nLower = catches weak fragments for accumulator\nDefault 0.58");
-                        let nf_resp = ui.add(egui::Slider::new(&mut self.settings.min_conf, 0.40..=0.80)
-                            .fixed_decimals(2))
-                            .on_hover_text("Minimum conf gate floor. Lower catches more weak signal energy for the accumulator. Raise if seeing garbage.");
-                        if nf_resp.changed() {
-                            let _ = self.settings_watch_tx.send(self.settings.clone());
-                        }
-                        if nf_resp.drag_released() {
                             save_config(&self.settings);
                         }
                     });
@@ -1887,13 +1897,10 @@ impl eframe::App for Fsk441App {
                             ui.label(egui::RichText::new(text)
                                 .monospace().color(text_col));
                         });
-                        // Show DF bin + conf + time
-                        let df_str = e.df_bin_hz
-                            .map(|d| format!("{:+.0}Hz ", d))
-                            .unwrap_or_default();
+                        // conf + time only — DF is meaningless for a multi-fragment accumulation
                         ui.label(egui::RichText::new(
-                            format!("{}conf {:.2}  {}",
-                                df_str, e.confidence,
+                            format!("conf {:.2}  {}",
+                                e.confidence,
                                 e.timestamp.format("%H:%M:%S")))
                             .color(egui::Color32::from_gray(170)));
                         ui.add_space(2.0);
@@ -2292,9 +2299,18 @@ impl eframe::App for Fsk441App {
                                 ui.close_menu();
                             }
                             if ui.button("📋 Copy with header").clicked() {
+                                let strength = match e.ccf_ratio as u32 {
+                                    0..=49    => 1u32, 50..=99   => 2, 100..=199  => 3,
+                                    200..=399 => 4,   400..=799  => 5, 800..=1599  => 6,
+                                    1600..=3199 => 7, 3200..=6399 => 8, _ => 9,
+                                };
+                                let dur_str = if e.duration_ms > 0.0 {
+                                    format!("{:.0}/{}", e.duration_ms, strength)
+                                } else { String::new() };
                                 ui.output_mut(|o| o.copied_text = format!(
-                                    "{} DF={:+.0} {}",
-                                    e.timestamp.format("%H:%M:%S"), e.df_hz, e.raw.trim()
+                                    "{} DF={:+.0} {} {}",
+                                    e.timestamp.format("%H:%M:%S"), e.df_hz,
+                                    dur_str, e.raw.trim()
                                 ));
                                 ui.close_menu();
                             }
@@ -2533,6 +2549,12 @@ impl eframe::App for Fsk441App {
                     egui::Grid::new("filt").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                         ui.label("cty.dat path:"); ui.text_edit_singleline(&mut self.settings.cty_path); ui.end_row();
                         ui.label("Max range (km):"); ui.add(egui::Slider::new(&mut self.settings.max_km, 500.0..=5000.0).integer()); ui.end_row();
+                        ui.label("");
+                        ui.label(egui::RichText::new("cty.dat defines valid callsign prefixes to decode")
+                            .color(egui::Color32::from_gray(140))
+                            .italics()
+                            .size(11.0));
+                        ui.end_row();
                     });
 
                     // ── Antenna ───────────────────────────────────────────
@@ -2680,14 +2702,20 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
     // α=0.001 → time constant ~1000 pings ≈ 3 minutes at typical ping rates.
     // Only pings BELOW current adaptive_conf_threshold feed the EMA, so real
     // signal bursts and interference spikes don't contaminate the noise estimate.
-    // threshold = max(noise_mean + K*noise_sigma, min_conf)
-    // min_conf is user-adjustable (default 0.58) — the NF floor slider
-    // Lower = more sensitive, catches weak accumulator fragments
-    // Higher = cleaner, fewer false passes
+    //
+    // threshold = noise_mean + k_sigma × noise_sigma
+    //
+    // This is mathematically derived: mean_confidence = (best-second)/best for
+    // 4-tone FSK, where noise energies are i.i.d. exponential. The EMA measures
+    // the actual distribution on the operator's band and k_sigma is the sole
+    // operator control — no hardcoded floor needed or justified.
     const EMA_ALPHA:    f32 = 0.001;
-    let mut noise_mean:     f32 = 0.44;
-    let mut noise_var:      f32 = 0.0004;
-    let mut adaptive_conf_threshold: f32 = settings.min_conf;
+    let mut noise_mean:     f32 = 0.44;   // prior: E[normalised margin] for 4-tone noise
+    let mut noise_var:      f32 = 0.0004; // prior: σ² ≈ 0.02²
+    // Cold-start threshold from priors: 0.44 + 5×0.02 = 0.54
+    // Once EMA warms up it takes over completely.
+    let mut adaptive_conf_threshold: f32 =
+        noise_mean + settings.k_sigma * noise_var.sqrt();
     let mut ema_ping_count: u32 = 0;
     const EMA_WARMUP_PINGS: u32 = 500;
     // Brief startup delay — allow audio stream to stabilise before accepting pings
@@ -2766,15 +2794,8 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
                 noise_mean = 0.44;
                 noise_var  = 0.0004;
                 ema_ping_count = 0;
-                adaptive_conf_threshold = settings.min_conf;
+                adaptive_conf_threshold = noise_mean + settings.k_sigma * noise_var.sqrt();
                 log::info!("[NOISE] EMA reset after QSY — restarting noise floor measurement");
-            }
-
-            // If user raised min_conf above current adaptive threshold, raise it immediately
-            if settings.min_conf > adaptive_conf_threshold {
-                adaptive_conf_threshold = settings.min_conf;
-                log::info!("[NOISE] User raised conf floor to {:.2} — adaptive threshold updated",
-                    settings.min_conf);
             }
 
             // Clear accumulator pulse — fired from LOG QSO button
@@ -2881,13 +2902,18 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
             if ema_ping_count >= EMA_WARMUP_PINGS {
                 let noise_sigma = noise_var.sqrt();
                 adaptive_conf_threshold = (noise_mean + settings.k_sigma * noise_sigma)
-                    .max(settings.min_conf)  // user NF floor — the primary control
                     .min(0.90);
             }
         }
 
-        // Send conf of every ping to UI for live display (regardless of gate)
-        let _ = event_tx.send(EngineEvent::ConfUpdate(conf));
+        // Settled = warmed up AND σ/μ < 8% — EMA has converged on this band's noise floor.
+        // Naturally goes false again if band conditions shift significantly.
+        let nf_settled = ema_ping_count >= EMA_WARMUP_PINGS
+            && noise_mean > 1e-6
+            && (noise_var.sqrt() / noise_mean) < 0.08;
+
+        // Send conf + settled state to UI on every ping for live NF label colour
+        let _ = event_tx.send(EngineEvent::ConfUpdate(conf, nf_settled));
 
         // Log and report adaptive threshold every ~5 minutes
         if ema_ping_count > 0 && ema_ping_count % 1500 == 0 {
@@ -2926,7 +2952,7 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
         // Feed any ping with conf above noise_mean + 2σ regardless of CCF.
         // Stop feeding once a good decode has been achieved (validity >= 60)
         // to prevent noise fragments from corrupting a settled accumulation.
-        let accum_gate_conf = (noise_mean + 2.0 * noise_var.sqrt()).max(0.40);
+        let accum_gate_conf = noise_mean + 2.0 * noise_var.sqrt();
         let accum_gate = conf >= accum_gate_conf
             && result.raw_decode.trim().len() >= 2
             && accum_best_score < 60;  // freeze once good decode seen
@@ -2946,7 +2972,7 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
 
         // QSO content override — callsign matching is specific enough without DF gate
         let content_override = in_qso
-            && conf >= (noise_mean + 3.0 * noise_var.sqrt()).max(0.45)
+            && conf >= noise_mean + 3.0 * noise_var.sqrt()
             && {
                 if let Some(ref their) = settings.their_call_hint {
                     qso_content_match(&result.raw_decode, their)
@@ -2966,7 +2992,7 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
         // automatically — no separate control needed.
         let noise_sigma_now = noise_var.sqrt();
         let capture_k = (settings.k_sigma - 1.5_f32).max(0.5);
-        let capture_gate_conf = (noise_mean + capture_k * noise_sigma_now).max(0.40);
+        let capture_gate_conf = noise_mean + capture_k * noise_sigma_now;
         if conf >= capture_gate_conf && !result.char_probs.is_empty() {
             let ap = AnalysisPing {
                 detected_at:     ping.timestamp.to_rfc3339(),
@@ -3025,7 +3051,7 @@ fn save_config(s: &Settings) {
         Period::TxSecond15 => "second15",
     };
     let data = format!(
-        "my_call={}\nmy_loc={}\ninput={}\noutput={}\nrig_model={}\nrig_port={}\nrig_baud={}\nhamlib_enabled={}\nperiod={}\ncty_path={}\nmax_km={}\nmin_ccf={}\nmin_conf={}\ntx_level={}\nant_bw_horiz={}\nant_bw_vert={}\nk_sigma={}\nsave_max_data={}\n",
+        "my_call={}\nmy_loc={}\ninput={}\noutput={}\nrig_model={}\nrig_port={}\nrig_baud={}\nhamlib_enabled={}\nperiod={}\ncty_path={}\nmax_km={}\nmin_ccf={}\ntx_level={}\nant_bw_horiz={}\nant_bw_vert={}\nk_sigma={}\nsave_max_data={}\n",
         s.my_call,
         s.my_loc,
         s.sel_in.as_deref().unwrap_or(""),
@@ -3038,7 +3064,6 @@ fn save_config(s: &Settings) {
         s.cty_path,
         s.max_km,
         s.min_ccf,
-        s.min_conf,
         s.tx_level,
         s.ant_bw_horiz,
         s.ant_bw_vert,
@@ -3077,7 +3102,7 @@ fn load_config() -> Settings {
             "cty_path"       => s.cty_path  = v.to_string(),
             "max_km"         => s.max_km    = v.parse().unwrap_or(3000.0),
             "min_ccf"        => s.min_ccf   = v.parse().unwrap_or(200.0),  // legacy
-            "min_conf"       => s.min_conf  = v.parse().unwrap_or(0.58),
+            "min_conf"       => {}  // legacy — removed; EMA derives threshold automatically
             "tx_level"       => s.tx_level  = v.parse().unwrap_or(0.1),
             "ant_bw_horiz"   => s.ant_bw_horiz = v.parse().unwrap_or(40.0),
             "ant_bw_vert"    => s.ant_bw_vert   = v.parse().unwrap_or(40.0),

@@ -1,6 +1,6 @@
 [package]
 name        = "fsk441plus"
-version     = "0.1.8"
+version     = "0.1.9"
 edition     = "2021"
 authors     = ["Roger Banks <GW4WND>"]
 description = "FSK441+ Meteor Scatter Transceiver"
