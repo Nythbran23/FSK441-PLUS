@@ -291,7 +291,7 @@ impl Default for Settings {
             k_sigma:        5.0,    // μ + 5σ default
             clear_accumulator: false,
             their_df_hz: None,
-            tx_level:       0.02,
+            tx_level:       1.0,
             ant_bw_horiz:   40.0,
             ant_bw_vert:    40.0,
             save_max_data:  false,
@@ -971,7 +971,7 @@ impl Fsk441App {
                         self.qso_log.push(format!("AUTO: {}", msg));
                         if let Some(tx_msg) = self.qso.tx_message() {
                             let dev = self.settings.audio_out();
-                            let _ = self.tx_cmd_tx.send(TxCommand::Transmit { message: tx_msg, output_device: dev, volume: self.settings.tx_level });
+                            let _ = self.tx_cmd_tx.send(TxCommand::Transmit { message: tx_msg, output_device: dev });
                         }
                     }
                     Transition::Complete => {
@@ -1058,10 +1058,12 @@ impl Fsk441App {
     fn send_tx(&mut self, msg: &str) {
         self.set_serial_ptt(true);
         let dev = self.settings.audio_out();
+        // ReArm clears the halted guard set by STOP — must precede Transmit
+        let _ = self.tx_cmd_tx.send(TxCommand::ReArm);
+        let _ = self.tx_cmd_tx.send(TxCommand::SetVolume(self.settings.tx_level));
         let _ = self.tx_cmd_tx.send(TxCommand::Transmit {
             message: msg.to_string(),
             output_device: dev,
-            volume: self.settings.tx_level,
         });
         self.is_transmitting = true;
         // tx_active is controlled solely by hamlib PTT events — do NOT set here
@@ -1790,10 +1792,15 @@ impl eframe::App for Fsk441App {
                         egui::RichText::new("■ STOP").color(egui::Color32::from_gray(170))
                     };
                     if ui.add_enabled(is_tx, egui::Button::new(stop_text)).clicked() {
-                        log::info!("[APP] STOP button clicked");
+                        log::info!("[APP] STOP button clicked — reverting to RX");
                         self.halt_tx();
                         self.active_tx_idx = None;
                         self.qso = QsoState::Idle;
+                        // Release QSO constraint so run_engine reverts to normal RX decoding
+                        self.settings.their_call_hint = None;
+                        self.settings.their_df_hz = None;
+                        let _ = self.settings_watch_tx.send(self.settings.clone());
+                        self.qso_time_on = None;
                         self.qso_log.push("STOPPED".to_string());
                     }
                     if ui.button(egui::RichText::new("⟳ Clear")
@@ -2668,8 +2675,8 @@ impl eframe::App for Fsk441App {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         ui.label("TX Level:");
-                        ui.add(egui::Slider::new(&mut self.settings.tx_level, 0.0..=0.05)
-                            .custom_formatter(|v, _| format!("{:.1}%", v * 100.0)));
+                        ui.add(egui::Slider::new(&mut self.settings.tx_level, 0.0..=1.0)
+                            .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
                     });
 
                     // ── Filtering ─────────────────────────────────────────
@@ -2710,6 +2717,7 @@ impl eframe::App for Fsk441App {
                         self.period_timer = PeriodTimer::new(self.settings.period);
                         let _ = self.tx_cmd_tx.send(TxCommand::SetOutputDevice(self.settings.audio_out()));
                         let _ = self.tx_cmd_tx.send(TxCommand::SetHamlib(self.settings.hamlib_addr()));
+                        let _ = self.tx_cmd_tx.send(TxCommand::SetVolume(self.settings.tx_level));
                         // Kill existing rigctld if hamlib disabled
                         if !self.settings.hamlib_enabled {
                             std::process::Command::new("pkill").args(["-f", "rigctld"]).spawn().ok();
@@ -3260,7 +3268,7 @@ fn load_config() -> Settings {
             "max_km"         => s.max_km    = v.parse().unwrap_or(3000.0),
             "min_ccf"        => s.min_ccf   = v.parse().unwrap_or(200.0),  // legacy
             "min_conf"       => {}  // legacy — removed; EMA derives threshold automatically
-            "tx_level"       => s.tx_level  = v.parse().unwrap_or(0.02),
+            "tx_level"       => s.tx_level  = v.parse().unwrap_or(1.0),
             "ant_bw_horiz"   => s.ant_bw_horiz = v.parse().unwrap_or(40.0),
             "ant_bw_vert"    => s.ant_bw_vert   = v.parse().unwrap_or(40.0),
             "k_sigma"        => s.k_sigma       = v.parse().unwrap_or(5.0),

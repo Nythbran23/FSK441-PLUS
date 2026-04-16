@@ -53,11 +53,19 @@ pub fn encode_message(msg: &str) -> Vec<u8> {
 
 pub fn gen441(tones: &[u8]) -> Vec<f32> {
     let dt = 1.0_f32 / SAMPLE_RATE_F;
+    // Baseline amplitude matches MSHV's default TX level (vol_win ≈ 0.612 at slider=95/100)
+    // This ensures the slider's 100% position gives the same output level as MSHV defaults.
+    // The tx_level slider (0.0–1.0) scales from silence up to this baseline.
+    const BASE_AMPLITUDE: f32 = 0.612;
     let mut s = Vec::with_capacity(tones.len() * NSPD);
     let mut phi = 0.0f32;
     for &ti in tones {
         let dpha = TAU * tone_freq(ti as usize) * dt;
-        for _ in 0..NSPD { phi += dpha; if phi > TAU { phi -= TAU; } s.push(phi.sin()); }
+        for _ in 0..NSPD {
+            phi += dpha;
+            if phi > TAU { phi -= TAU; }
+            s.push(phi.sin() * BASE_AMPLITUDE);
+        }
     }
     s
 }
@@ -417,11 +425,11 @@ fn play_audio_blocking(samples: Vec<f32>, device_name: Option<String>, cancel: s
     let mut elapsed = 0u64;
     while elapsed < total_ms {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            log::info!("[TX] Cancelled after {}ms", elapsed);
-            break;
+            log::info!("[TX] Cancelled after {}ms — dropping stream", elapsed);
+            break; // drop(stream) below stops audio within one hardware buffer period
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        elapsed += 100;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        elapsed += 50;
     }
     drop(stream);
     log::info!("[TX] play_audio_blocking done");
@@ -509,9 +517,11 @@ impl PttMethod {
 
 #[derive(Debug, Clone)]
 pub enum TxCommand {
-    Transmit      { message: String, output_device: Option<String>, volume: f32 },
+    Transmit      { message: String, output_device: Option<String> },
     #[allow(dead_code)]
-    TransmitN     { message: String, times: u8, output_device: Option<String>, volume: f32 },
+    TransmitN     { message: String, times: u8, output_device: Option<String> },
+    SetVolume     (f32),   // update TX level immediately — takes effect on next waveform build
+    ReArm,                 // clear halted flag — sent by send_tx before Transmit
     Halt,
     SetPeriod     (Period),
     SetOutputDevice(Option<String>),
@@ -650,6 +660,8 @@ pub struct TxEngine {
     pub ptt_method:        PttMethod,
     pub ptt_port:          Option<String>,
     pub tx_active:         std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub current_volume:    f32,   // live TX level — updated by SetVolume command
+    pub halted:            bool,  // set by Halt — blocks any new Transmit until cleared
 }
 
 impl TxEngine {
@@ -661,7 +673,8 @@ impl TxEngine {
         hamlib_update_tx: mpsc::UnboundedSender<HamlibUpdate>,
         tx_active:        std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self { Self { cmd_rx, period, output_device, hamlib_addr, hamlib_update_tx,
-        ptt_method: PttMethod::CatHamlib, ptt_port: None, tx_active } }
+        ptt_method: PttMethod::CatHamlib, ptt_port: None, tx_active,
+        current_volume: 1.0, halted: false } }
 
     pub async fn run(mut self) {
         let mut tx_par: u8 = match self.period {
@@ -700,6 +713,7 @@ impl TxEngine {
                 match cmd {
                     TxCommand::Halt => {
                         log::info!("[TX] HALT");
+                        self.halted = true;
                         cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                         // Drop PTT and ungate fanout immediately — audio will drain/stop
                         self.tx_active.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -744,10 +758,25 @@ impl TxEngine {
                             log::info!("[TX] SetFreq → {} Hz", hz);
                         }
                     }
+                    TxCommand::ReArm => {
+                        log::info!("[TX] ReArm — ready to transmit");
+                        self.halted = false;
+                    }
+                    TxCommand::SetVolume(v) => {
+                        log::info!("[TX] Volume updated to {:.4} ({:.1}%)", v, v * 100.0);
+                        self.current_volume = v;
+                    }
                     TxCommand::ClearAccumulator => {
                         // Handled in run_engine — ignore here
                     }
                     other => {
+                        // If halted, discard any Transmit that sneaks in after STOP
+                        // until the engine is explicitly re-armed by the next user TX press.
+                        // SetVolume, SetPeriod etc. still pass through above.
+                        if self.halted {
+                            log::info!("[TX] Ignoring command after HALT — re-arm by pressing TX");
+                            continue;
+                        }
                         let arrival_sidx = slot_idx_p(utc_ms(), self.period);
                         current = Some(other);
                         tx_count = 0;
@@ -796,19 +825,19 @@ impl TxEngine {
             }
 
             // Nothing to transmit
-            let (message, dev, volume) = match &current {
+            let (message, dev) = match &current {
                 None => {
                     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                     continue;
                 }
-                Some(TxCommand::Transmit { message, output_device, volume }) =>
-                    (message.clone(), output_device.clone(), *volume),
-                Some(TxCommand::TransmitN { message, times, output_device, volume }) => {
+                Some(TxCommand::Transmit { message, output_device }) =>
+                    (message.clone(), output_device.clone()),
+                Some(TxCommand::TransmitN { message, times, output_device, .. }) => {
                     if tx_count >= *times {
                         current = None; tx_count = 0;
                         continue;
                     }
-                    (message.clone(), output_device.clone(), *volume)
+                    (message.clone(), output_device.clone())
                 }
                 Some(TxCommand::Halt) => {
                     current = None; tx_count = 0;
@@ -820,7 +849,9 @@ impl TxEngine {
                 | Some(TxCommand::SetHamlib(_))
                 | Some(TxCommand::SetPttMethod(_, _))
                 | Some(TxCommand::ClearAccumulator)
-                | Some(TxCommand::SetFreq(_)) => {
+                | Some(TxCommand::SetFreq(_))
+                | Some(TxCommand::SetVolume(_))
+                | Some(TxCommand::ReArm) => {
                     current = None;
                     continue;
                 }
@@ -857,6 +888,8 @@ impl TxEngine {
             let mut waveform: Vec<f32> = Vec::with_capacity(slot_samples);
             for _ in 0..repeats { waveform.extend_from_slice(&one_msg); }
             waveform.truncate(slot_samples);
+            // Use self.current_volume — may have been updated by SetVolume since Transmit arrived
+            let volume = self.current_volume;
             // Apply TX level — scale samples by operator-configured amplitude (0.0–1.0)
             if (volume - 1.0f32).abs() > 1e-4 {
                 for s in &mut waveform { *s *= volume; }
