@@ -51,6 +51,29 @@ pub fn encode_message(msg: &str) -> Vec<u8> {
     t
 }
 
+/// Generate FSK441 audio natively at `device_rate` Hz.
+/// Like MSHV, we scale NSPD by `device_rate/11025` so tones are mathematically
+/// correct at the device's actual sample rate — no resampling needed or used.
+pub fn gen441_at_rate(tones: &[u8], device_rate: u32) -> Vec<f32> {
+    // Ratio of device rate to base FSK441 rate (11025 Hz)
+    let koef = device_rate as f64 / SAMPLE_RATE as f64;
+    // Samples per dit at device rate — must be integer for clean tone boundaries
+    let nspd = (NSPD as f64 * koef).round() as usize;
+    let dt = 1.0_f64 / device_rate as f64;
+    const BASE_AMPLITUDE: f32 = 0.612;
+    let mut s = Vec::with_capacity(tones.len() * nspd);
+    let mut phi = 0.0_f64;
+    for &ti in tones {
+        let freq = tone_freq(ti as usize) as f64;
+        let dpha = std::f64::consts::TAU * freq * dt;
+        for _ in 0..nspd {
+            phi += dpha;
+            s.push((phi.sin() as f32) * BASE_AMPLITUDE);
+        }
+    }
+    s
+}
+
 pub fn gen441(tones: &[u8]) -> Vec<f32> {
     let dt = 1.0_f32 / SAMPLE_RATE_F;
     // Baseline amplitude matches MSHV's default TX level (vol_win ≈ 0.612 at slider=95/100)
@@ -108,6 +131,37 @@ pub fn find_input_device(display_name: &str) -> Option<cpal::Device> {
 /// capability checks, but build_output_stream() succeeds. We use host.devices()
 /// WITHOUT capability filtering as the fallback so the correct device is found.
 /// Then msk2k_audio::AudioOutput::start() tries build_output_stream() directly.
+/// Query the actual output sample rate of the named device.
+/// Prefers 44100Hz (exact 4× multiple of 11025Hz FSK441 base rate, zero baud error).
+/// Falls back to device default, then OUTPUT_SAMPLE_RATE.
+fn get_device_rate(device_name: Option<&str>) -> u32 {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let device = if let Some(name) = device_name {
+        find_output_device(name)
+    } else {
+        cpal::default_host().default_output_device()
+    };
+    if let Some(d) = device {
+        // Check if 44100Hz is supported — perfect integer multiple of 11025Hz
+        if let Ok(configs) = d.supported_output_configs() {
+            for cfg in configs {
+                if cfg.min_sample_rate().0 <= 44100 && cfg.max_sample_rate().0 >= 44100 {
+                    log::info!("[TX] Device supports 44100Hz — using for zero baud error");
+                    return 44100;
+                }
+            }
+        }
+        // Fall back to device default
+        if let Ok(cfg) = d.default_output_config() {
+            let rate = cfg.sample_rate().0;
+            log::info!("[TX] Device actual sample rate: {}Hz", rate);
+            return rate;
+        }
+    }
+    log::warn!("[TX] Could not query device rate — using {}", OUTPUT_SAMPLE_RATE);
+    OUTPUT_SAMPLE_RATE
+}
+
 fn find_output_device(display_name: &str) -> Option<cpal::Device> {
     #[allow(unused_imports)]
     let (base, _) = parse_device_suffix(display_name);
@@ -144,20 +198,22 @@ fn find_output_device(display_name: &str) -> Option<cpal::Device> {
     None
 }
 
-// ─── Audio playback — uses msk2k_audio AudioOutputBuilder ────────────────────
+// ─── Audio playback ───────────────────────────────────────────────────────────
 
-/// Open a persistent CPAL output stream for Windows WASAPI on a dedicated std::thread.
-/// Mirrors the MSK2K pattern: try Fixed buffer first, fall back to Default + device channels.
-/// Handles mono→stereo upmix if device only supports stereo.
-#[cfg(target_os = "windows")]
+/// Open a persistent CPAL output stream on a dedicated std::thread.
+/// Mirrors the MSK2K pattern: stream lives for the engine lifetime, never closed between TX slots.
+/// Eliminates CoreAudio/WASAPI teardown latency (~2s on USB devices).
 fn open_persistent_output_stream(
     device_name: Option<String>,
 ) -> Option<std::sync::mpsc::SyncSender<Vec<f32>>> {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(4);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
 
+    // Query device rate before spawning — persistent stream uses native rate
+    let stream_rate = get_device_rate(device_name.as_deref());
+
     std::thread::Builder::new()
-        .name("wasapi-audio".into())
+        .name("audio-output".into())
         .spawn(move || {
             use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
             let host = cpal::default_host();
@@ -169,67 +225,45 @@ fn open_persistent_output_stream(
             let device = match device {
                 Some(d) => d,
                 None => {
-                    log::error!("[TX] WASAPI thread: no output device");
+                    log::error!("[AUDIO] Persistent stream: no output device");
                     let _ = ready_tx.send(false);
                     return;
                 }
             };
 
-            // Log ALL supported configs so we know exactly what this device accepts
-            log::info!("[WASAPI] Enumerating supported output configs for '{}'",
-                device.name().unwrap_or_default());
-            if let Ok(configs) = device.supported_output_configs() {
-                for c in configs {
-                    log::info!("[WASAPI] Supported: ch={} rate={}-{} format={:?} buf={:?}",
-                        c.channels(),
-                        c.min_sample_rate().0,
-                        c.max_sample_rate().0,
-                        c.sample_format(),
-                        c.buffer_size());
-                }
-            }
-            if let Ok(def) = device.default_output_config() {
-                log::info!("[WASAPI] Default config: ch={} rate={} format={:?}",
-                    def.channels(), def.sample_rate().0, def.sample_format());
-            }
+            log::info!("[AUDIO] Persistent stream on '{}' @ {}Hz",
+                device.name().unwrap_or_default(), stream_rate);
 
             let requested = cpal::StreamConfig {
                 channels: 1,
-                sample_rate: cpal::SampleRate(OUTPUT_SAMPLE_RATE),
+                sample_rate: cpal::SampleRate(stream_rate),
                 buffer_size: cpal::BufferSize::Fixed(AUDIO_BUFFER_SIZE as u32),
             };
             let (stream_config, channels) = {
                 let test = device.build_output_stream(&requested, |_: &mut [f32], _| {}, |_| {}, None);
                 if test.is_ok() {
                     drop(test);
-                    log::info!("[WASAPI] Using 1ch Fixed at {}Hz", OUTPUT_SAMPLE_RATE);
+                    log::info!("[AUDIO] Using 1ch Fixed at {}Hz", stream_rate);
                     (requested, 1usize)
                 } else {
                     let def = device.default_output_config().unwrap();
                     let ch = def.channels() as usize;
                     let fallback = cpal::StreamConfig {
                         channels: ch as u16,
-                        sample_rate: cpal::SampleRate(OUTPUT_SAMPLE_RATE),
+                        sample_rate: cpal::SampleRate(stream_rate),
                         buffer_size: cpal::BufferSize::Default,
                     };
-                    log::info!("[WASAPI] Falling back to {}ch Default at {}Hz", ch, OUTPUT_SAMPLE_RATE);
+                    log::info!("[AUDIO] Falling back to {}ch Default at {}Hz", ch, stream_rate);
                     (fallback, ch)
                 }
             };
 
             let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
             let buf2 = buf.clone();
-            let callback_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let callback_count2 = callback_count.clone();
 
             let stream = match device.build_output_stream(
                 &stream_config,
                 move |out: &mut [f32], _| {
-                    let count = callback_count2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if count % 235 == 0 {
-                        log::info!("[WASAPI] callback #{} alive, buf={}",
-                            count, buf2.lock().map(|b| b.len()).unwrap_or(0));
-                    }
                     let mut b = buf2.lock().unwrap();
                     let frames = out.len() / channels;
                     let copy = frames.min(b.len());
@@ -238,7 +272,6 @@ fn open_persistent_output_stream(
                         b.drain(..copy);
                         out[copy..].fill(0.0);
                     } else {
-                        // Upmix mono→stereo (or more channels)
                         for i in 0..copy {
                             let s = b[i];
                             for ch in 0..channels {
@@ -249,41 +282,40 @@ fn open_persistent_output_stream(
                         out[copy * channels..].fill(0.0);
                     }
                 },
-                |e| log::error!("[WASAPI] stream error: {}", e),
+                |e| log::error!("[AUDIO] Stream error: {}", e),
                 None,
             ) {
                 Ok(s) => s,
                 Err(e) => {
-                    log::error!("[WASAPI] build_output_stream failed: {}", e);
+                    log::error!("[AUDIO] build_output_stream failed: {}", e);
                     let _ = ready_tx.send(false);
                     return;
                 }
             };
 
             if let Err(e) = stream.play() {
-                log::error!("[WASAPI] stream.play failed: {}", e);
+                log::error!("[AUDIO] stream.play failed: {}", e);
                 let _ = ready_tx.send(false);
                 return;
             }
 
-            log::info!("[WASAPI] Stream running on '{}' {}ch",
-                device.name().unwrap_or_default(), channels);
+            log::info!("[AUDIO] Persistent output stream running");
             let _ = ready_tx.send(true);
 
             loop {
                 match cmd_rx.recv() {
                     Ok(samples) => {
                         if samples.is_empty() {
-                            log::info!("[WASAPI] Clear command — draining buffer");
+                            log::info!("[AUDIO] Clear command — draining buffer");
                             buf.lock().unwrap().clear();
                         } else {
                             let n = samples.len();
                             buf.lock().unwrap().extend_from_slice(&samples);
-                            log::info!("[WASAPI] Waveform: {} samples queued", n);
+                            log::info!("[AUDIO] Waveform: {} samples queued", n);
                         }
                     }
-                    Err(e) => {
-                        log::error!("[WASAPI] cmd_rx error: {} — exiting", e);
+                    Err(_) => {
+                        log::info!("[AUDIO] Persistent stream shutting down");
                         break;
                     }
                 }
@@ -294,11 +326,11 @@ fn open_persistent_output_stream(
 
     match ready_rx.recv() {
         Ok(true) => {
-            log::info!("[WASAPI] Persistent stream ready");
+            log::info!("[AUDIO] Persistent output stream ready");
             Some(cmd_tx)
         }
         _ => {
-            log::error!("[WASAPI] Persistent stream failed to start");
+            log::error!("[AUDIO] Persistent output stream failed to start");
             None
         }
     }
@@ -330,8 +362,6 @@ fn set_serial_ptt(port_name: &str, method: &PttMethod, active: bool) {
 }
 
 fn play_audio_blocking(samples: Vec<f32>, device_name: Option<String>, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) {
-    #[allow(unused_imports)]
-
     let n = samples.len();
 
     let device = if let Some(ref name) = device_name {
@@ -343,27 +373,30 @@ fn play_audio_blocking(samples: Vec<f32>, device_name: Option<String>, cancel: s
 
     let device = match device {
         Some(d) => d,
-        None    => {
+        None => {
             use cpal::traits::HostTrait;
             log::warn!("[TX] Using system default output device");
             match cpal::default_host().default_output_device() {
                 Some(d) => d,
-                None    => { log::error!("[TX] No output device"); return; }
+                None => { log::error!("[TX] No output device"); return; }
             }
         }
     };
 
     log::info!("[TX] Playing on: '{}'", device.name().unwrap_or_default());
 
-    // Upsample to device output rate (48000Hz — devices reject 11025Hz on Windows)
-    let samples = upsample(&samples);
-    let n = samples.len();
-
-    // Build output stream — try Fixed 1ch first, fall back to device default channels
     use cpal::traits::{DeviceTrait, StreamTrait};
+
+    // Get device native rate
+    let device_rate = device.default_output_config()
+        .map(|c| c.sample_rate().0)
+        .unwrap_or(OUTPUT_SAMPLE_RATE);
+    log::info!("[TX] Stream at {}Hz ({} samples = {:.1}s)", device_rate, n, n as f32 / device_rate as f32);
+
+    // Build stream config — try 1ch Fixed first, fall back to device default
     let requested = cpal::StreamConfig {
         channels: 1,
-        sample_rate: cpal::SampleRate(OUTPUT_SAMPLE_RATE),
+        sample_rate: cpal::SampleRate(device_rate),
         buffer_size: cpal::BufferSize::Fixed(AUDIO_BUFFER_SIZE as u32),
     };
     let (stream_config, channels) = {
@@ -376,37 +409,63 @@ fn play_audio_blocking(samples: Vec<f32>, device_name: Option<String>, cancel: s
             let ch = def.channels() as usize;
             let fallback = cpal::StreamConfig {
                 channels: ch as u16,
-                sample_rate: cpal::SampleRate(OUTPUT_SAMPLE_RATE),
+                sample_rate: cpal::SampleRate(device_rate),
                 buffer_size: cpal::BufferSize::Default,
             };
-            log::info!("[TX] Falling back to {}ch Default at {}Hz", ch, OUTPUT_SAMPLE_RATE);
+            log::info!("[TX] Falling back to {}ch Default at {}Hz", ch, device_rate);
             (fallback, ch)
         }
     };
-    log::info!("[TX] play_audio_blocking: {}ch {}Hz {} samples",
-        channels, OUTPUT_SAMPLE_RATE, n);
-    // Put samples in a shared buffer
-    let buf = std::sync::Arc::new(std::sync::Mutex::new(samples.to_vec()));
-    let buf2 = buf.clone();
+    log::info!("[TX] play_audio_blocking: {}ch {}Hz {} samples", channels, device_rate, n);
+
+    // Channel-fed callback — MSK2K pattern.
+    // Sender holds the sample data; dropping sender signals end-of-audio.
+    // Callback serves silence once channel is exhausted — no abrupt teardown.
+    let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(2);
+
+    // Send samples in chunks matching the buffer size so the channel stays responsive
+    {
+        let audio_tx2 = audio_tx.clone();
+        std::thread::spawn(move || {
+            for chunk in samples.chunks(AUDIO_BUFFER_SIZE as usize) {
+                if audio_tx2.send(chunk.to_vec()).is_err() { break; }
+            }
+            // Drop audio_tx2 here — signals end of audio to callback
+        });
+    }
+    // Drop our copy of sender — only the spawned thread holds one
+    drop(audio_tx);
+
     let stream = match device.build_output_stream(
         &stream_config,
-        move |out: &mut [f32], _| {
-            let mut b = buf2.lock().unwrap();
-            let frames = out.len() / channels;
-            let copy = frames.min(b.len());
-            if channels == 1 {
-                out[..copy].copy_from_slice(&b[..copy]);
-                b.drain(..copy);
-                out[copy..].fill(0.0);
-            } else {
-                for i in 0..copy {
-                    let s = b[i];
-                    for ch in 0..channels {
-                        out[i * channels + ch] = if ch == 0 { s } else { 0.0 };
+        {
+            let mut remainder: Vec<f32> = Vec::new();
+            move |out: &mut [f32], _| {
+                let frames = out.len() / channels;
+                let mut filled = 0;
+                while filled < frames {
+                    if remainder.is_empty() {
+                        match audio_rx.try_recv() {
+                            Ok(chunk) => remainder = chunk,
+                            Err(_) => break,
+                        }
                     }
+                    let take = (frames - filled).min(remainder.len());
+                    if channels == 1 {
+                        out[filled..filled + take].copy_from_slice(&remainder[..take]);
+                    } else {
+                        for i in 0..take {
+                            let s = remainder[i];
+                            for ch in 0..channels {
+                                out[(filled + i) * channels + ch] = if ch == 0 { s } else { 0.0 };
+                            }
+                        }
+                    }
+                    remainder.drain(..take);
+                    filled += take;
                 }
-                b.drain(..copy);
-                out[copy * channels..].fill(0.0);
+                // Silence any unfilled frames
+                out[filled * channels..].fill(0.0);
             }
         },
         |e| log::error!("[TX] Output error: {}", e),
@@ -415,22 +474,25 @@ fn play_audio_blocking(samples: Vec<f32>, device_name: Option<String>, cancel: s
         Ok(s) => s,
         Err(e) => { log::error!("[TX] build_output_stream: {}", e); return; }
     };
+
     if let Err(e) = stream.play() {
         log::error!("[TX] stream.play: {}", e); return;
     }
 
-    // Drop PTT 200ms before audio ends so rig switches to RX as last samples drain
-    let total_ms = (n as u64 * 1000 / OUTPUT_SAMPLE_RATE as u64) + 500;
-    log::info!("[TX] Playing {} samples ({:.1}s)", n, n as f32 / OUTPUT_SAMPLE_RATE as f32);
+    // Wait for slot to complete or cancel
+    let total_ms = n as u64 * 1000 / device_rate as u64 + 500;
+    log::info!("[TX] Playing {} samples ({:.1}s)", n, n as f32 / device_rate as f32);
     let mut elapsed = 0u64;
     while elapsed < total_ms {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            log::info!("[TX] Cancelled after {}ms — dropping stream", elapsed);
-            break; // drop(stream) below stops audio within one hardware buffer period
+            log::info!("[TX] Cancelled after {}ms", elapsed);
+            break;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
         elapsed += 50;
     }
+    // Stream drains naturally — channel sender already dropped, callback serves silence.
+    // drop(stream) closes hardware after callback has finished serving remaining samples.
     drop(stream);
     log::info!("[TX] play_audio_blocking done");
 }
@@ -662,6 +724,7 @@ pub struct TxEngine {
     pub tx_active:         std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub current_volume:    f32,   // live TX level — updated by SetVolume command
     pub halted:            bool,  // set by Halt — blocks any new Transmit until cleared
+    pub device_rate:       u32,   // cached actual output sample rate — queried once at startup
 }
 
 impl TxEngine {
@@ -672,9 +735,15 @@ impl TxEngine {
         hamlib_addr:      Option<String>,
         hamlib_update_tx: mpsc::UnboundedSender<HamlibUpdate>,
         tx_active:        std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> Self { Self { cmd_rx, period, output_device, hamlib_addr, hamlib_update_tx,
-        ptt_method: PttMethod::CatHamlib, ptt_port: None, tx_active,
-        current_volume: 1.0, halted: false } }
+    ) -> Self {
+        // Query device rate once at startup — used for all waveform generation
+        let device_rate = get_device_rate(output_device.as_deref());
+        log::info!("[TX] Output device rate: {}Hz (koef={:.3}x)",
+            device_rate, device_rate as f64 / SAMPLE_RATE as f64);
+        Self { cmd_rx, period, output_device, hamlib_addr, hamlib_update_tx,
+            ptt_method: PttMethod::CatHamlib, ptt_port: None, tx_active,
+            current_volume: 1.0, halted: false, device_rate }
+    }
 
     pub async fn run(mut self) {
         let mut tx_par: u8 = match self.period {
@@ -692,9 +761,10 @@ impl TxEngine {
             HamlibClient::new(addr.clone(), self.hamlib_update_tx.clone())
         });
 
-        // ── Windows: persistent output stream on dedicated thread ─────────────
-        #[cfg(target_os = "windows")]
-        let win_audio_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>> = {
+        // ── Persistent output stream on dedicated thread (all platforms) ────────
+        // Stream lives for the full engine lifetime — never closed between TX slots.
+        // This eliminates the ~2s CoreAudio USB teardown latency on macOS.
+        let persistent_audio_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>> = {
             open_persistent_output_stream(self.output_device.clone())
         };
 
@@ -740,6 +810,9 @@ impl TxEngine {
                     TxCommand::SetOutputDevice(dev) => {
                         log::info!("[TX] Output device changed to {:?}", dev);
                         self.output_device = dev;
+                        // Re-query device rate for new device
+                        self.device_rate = get_device_rate(self.output_device.as_deref());
+                        log::info!("[TX] New device rate: {}Hz", self.device_rate);
                     }
                     TxCommand::SetHamlib(addr) => {
                         log::info!("[TX] Hamlib {}", if addr.is_some() { "enabled" } else { "disabled" });
@@ -873,16 +946,17 @@ impl TxEngine {
             };
             let slot_ms    = slot_secs as i64 * 1000;
             let now_ms     = utc_ms();
-            let slot_start = (now_ms / slot_ms) * slot_ms; // ms of current slot start
+            let slot_start = (now_ms / slot_ms) * slot_ms;
             let elapsed_ms = (now_ms - slot_start).max(0);
-            let remain_ms  = (slot_ms - elapsed_ms).max(500); // at least 500ms
-            let slot_samples = (SAMPLE_RATE as i64 * remain_ms / 1000) as usize;
-            log::info!("[TX] Slot: {}s period, {}ms elapsed, {}ms remaining → {} samples",
-                slot_secs, elapsed_ms, remain_ms, slot_samples);
-            // Add 3 spaces between repeats so messages don't run together
-            // "CQ GW4WND IO82   CQ GW4WND IO82   ..." — separators aid sync detection
+            let remain_ms  = (slot_ms - elapsed_ms).max(500);
+            // Use cached device rate — queried once at startup in TxEngine::new()
+            let device_rate = self.device_rate;
+            let slot_samples = (device_rate as i64 * remain_ms / 1000) as usize;
+            log::info!("[TX] Slot: {}s period, {}ms elapsed, {}ms remaining → {} samples @ {}Hz",
+                slot_secs, elapsed_ms, remain_ms, slot_samples, device_rate);
             let padded_msg   = format!("{}   ", message);
-            let one_msg      = message_to_audio(&padded_msg);
+            let encoded      = encode_message(&padded_msg);
+            let one_msg      = gen441_at_rate(&encoded, device_rate);
             let msg_len      = one_msg.len();
             let repeats      = (slot_samples + msg_len - 1) / msg_len;
             let mut waveform: Vec<f32> = Vec::with_capacity(slot_samples);
@@ -908,9 +982,9 @@ impl TxEngine {
                 volume, volume * 100.0, rms_dbfs, peak_dbfs, waveform.len()
             );
 
-            log::info!("[TX] Waveform: {} samples ({:.1}s), {} reps of {}ms",
-                waveform.len(), waveform.len() as f32 / SAMPLE_RATE_F,
-                repeats, msg_len * 1000 / SAMPLE_RATE as usize);
+            log::info!("[TX] Waveform: {} samples ({:.1}s @ {}Hz), {} reps of {}ms",
+                waveform.len(), waveform.len() as f32 / device_rate as f32,
+                device_rate, repeats, msg_len * 1000 / device_rate as usize);
 
             // PTT on — write tx_active immediately so run_engine sees it without UI roundtrip
             self.tx_active.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -927,45 +1001,27 @@ impl TxEngine {
             }
             let _ = self.hamlib_update_tx.send(HamlibUpdate { freq: None, connected: None, transmitting: true });
 
-            let duration_ms = waveform.len() as u64 * 1000 / SAMPLE_RATE as u64;
-            #[allow(unused_variables)]
-            let wait_ms = duration_ms + 500;
+            let duration_ms = waveform.len() as u64 * 1000 / device_rate as u64;
+            let wait_ms = duration_ms + 200; // 200ms tail — samples reach DAC, then PTT drops
 
-            // Play audio — Windows uses persistent dedicated-thread stream
-            #[cfg(target_os = "windows")]
-            {
-                if let Some(ref audio_tx) = win_audio_tx {
-                    let upsampled = upsample(&waveform);
-                    let n_samples = upsampled.len();
-                    if let Err(e) = audio_tx.send(upsampled) {
-                        log::error!("[TX] WASAPI send failed: {}", e);
-                    } else {
-                        log::info!("[TX] Windows: sent {} samples to WASAPI thread, waiting {}ms",
-                            n_samples, wait_ms);
-                        // Poll every 100ms so STOP/cancel is responsive
-                        let mut elapsed = 0u64;
-                        while elapsed < wait_ms {
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                            elapsed += 100;
-                            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                                // Clear audio buffer on the WASAPI thread
-                                let _ = audio_tx.send(vec![]);
-                                log::info!("[TX] Windows: cancelled after {}ms", elapsed);
-                                break;
-                            }
-                        }
-                    }
+            // Play audio — always use persistent stream (all platforms).
+            // Persistent stream avoids the ~2s CoreAudio/WASAPI teardown on every TX→RX.
+            // Falls back to open/close only if the persistent stream failed to open at startup.
+            if let Some(ref audio_tx) = persistent_audio_tx {
+                let n_samples = waveform.len();
+                let waveform: Vec<f32> = waveform;
+                if let Err(e) = audio_tx.send(waveform) {
+                    log::error!("[TX] Persistent stream send failed: {}", e);
                 } else {
-                    // Fallback if persistent stream failed to open
-                    let device = dev.or_else(|| self.output_device.clone());
-                    let cancel_clone = cancel_flag.clone();
-                    tokio::task::spawn_blocking(move || {
-                        play_audio_blocking(waveform, device, cancel_clone);
-                    }).await.ok();
+                    log::info!("[TX] Sent {} samples to persistent stream, waiting {}ms",
+                        n_samples, wait_ms);
+                    let deadline = tokio::time::Instant::now()
+                        + tokio::time::Duration::from_millis(wait_ms);
+                    tokio::time::sleep_until(deadline).await;
                 }
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
+            } else {
+                // Fallback: open/close stream (introduces teardown latency)
+                log::warn!("[TX] No persistent stream — falling back to open/close");
                 let device = dev.or_else(|| self.output_device.clone());
                 let cancel_clone = cancel_flag.clone();
                 tokio::task::spawn_blocking(move || {
@@ -973,7 +1029,9 @@ impl TxEngine {
                 }).await.ok();
             }
 
-            // PTT off — clear tx_active immediately
+            // PTT off — clear tx_active immediately after audio completes
+            // Note: play_audio_blocking has already returned, meaning all samples
+            // have been handed to the OS audio layer. PTT can safely drop now.
             self.tx_active.store(false, std::sync::atomic::Ordering::Relaxed);
             match &self.ptt_method {
                 PttMethod::CatHamlib => {
@@ -987,16 +1045,7 @@ impl TxEngine {
                 PttMethod::Vox => {}
             }
             let _ = self.hamlib_update_tx.send(HamlibUpdate { freq: None, connected: None, transmitting: false });
-
             log::info!("[TX] Done sidx={}", sidx);
-
-            // Wait for the slot to end before looping
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                let now_sidx = slot_idx_p(utc_ms(), self.period);
-                if now_sidx != sidx { break; }
-                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) { break; }
-            }
         }
     }
 }

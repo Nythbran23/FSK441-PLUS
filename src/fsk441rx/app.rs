@@ -1874,7 +1874,7 @@ impl eframe::App for Fsk441App {
                         if k_resp.changed() {
                             let _ = self.settings_watch_tx.send(self.settings.clone());
                         }
-                        if k_resp.drag_released() {
+                        if k_resp.drag_stopped() {
                             save_config(&self.settings);
                         }
                     });
@@ -2760,9 +2760,10 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
     let (ping_tx, mut ping_rx) = mpsc::unbounded_channel::<detector::DetectedPing>();
 
     // Keep a clone of audio_tx for Linux stream restart after TX
-    let audio_tx_for_restart = audio_tx.clone();
-    let audio_input_device   = settings.audio_in();
+    let _audio_tx_for_restart = audio_tx.clone();
+    let _audio_input_device   = settings.audio_in();
 
+    #[allow(unused_mut, unused_variables)]
     let mut audio_stop_handle = match audio::start_live(settings.audio_in(), audio_tx).await {
         Ok(h) => h,
         Err(e) => { log::error!("[ENGINE] Audio: {}", e); return; }
@@ -2924,7 +2925,7 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
                 if !is_tx && was_transmitting {
                     // 500ms settling delay — ALSA needs time after TX output closes
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    match audio::start_live(audio_input_device.clone(), audio_tx_for_restart.clone()).await {
+                    match audio::start_live(_audio_input_device.clone(), _audio_tx_for_restart.clone()).await {
                         Ok(h) => {
                             audio_stop_handle = h;
                             log::info!("[AUDIO] Linux: input stream restarted after TX");
