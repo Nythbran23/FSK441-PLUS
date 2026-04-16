@@ -2891,10 +2891,9 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
             Ok(None)    => break, // channel closed
             Err(_)      => {
                 // Timeout — detect RX→TX slot boundary during audio silence.
-                // Only trigger second pass when in QSO so we don't waste cycles
-                // processing noise on a dead band.
                 let is_tx = tx_active.load(std::sync::atomic::Ordering::Relaxed);
                 let in_qso = settings.their_call_hint.is_some();
+                // Second-pass: save analysis ring at RX→TX boundary when in QSO
                 if is_tx && !was_transmitting && in_qso {
                     if let Some(ref s) = store {
                         let entries: Vec<AnalysisPing> = analysis_ring.iter().cloned().collect();
@@ -2904,9 +2903,6 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
                                 Ok(cid) => {
                                     let _ = event_tx.send(EngineEvent::AnalysisSaved(cid, n));
                                     log::info!("[2PASS] RX period saved: {} pings capture_id={}", n, cid);
-                                    // Clear ring after save — each capture is THIS RX period only.
-                                    // Without this, every successive save grows the pool with old
-                                    // pings and re-emits identical recoveries every TX slot.
                                     analysis_ring.clear();
                                 }
                                 Err(e) => log::error!("[DB] 2PASS save failed: {}", e),
@@ -2992,10 +2988,28 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
         }
         was_transmitting = false;
 
-        // Detect slot boundary → process accumulated fragments (DON'T clear — persist cross-slot)
+        // Detect slot boundary → process accumulated fragments and flush analysis ring
         let now_ms    = chrono::Utc::now().timestamp_millis();
         let slot_idx  = now_ms / 30_000;
         if slot_idx != current_slot_idx && current_slot_idx >= 0 {
+            // ── Flush analysis ring to DB when Max Data is on ─────────────────
+            // Saves soft-bit char_probs for every ping captured this slot,
+            // regardless of QSO state — for post-session offline analysis.
+            if settings.save_max_data {
+                if let Some(ref s) = store {
+                    let entries: Vec<AnalysisPing> = analysis_ring.iter().cloned().collect();
+                    if !entries.is_empty() {
+                        match s.save_analysis(&entries) {
+                            Ok(cid) => {
+                                log::info!("[MAX_DATA] Slot flush: {} analysis pings saved (capture_id={})", entries.len(), cid);
+                                analysis_ring.clear();
+                            }
+                            Err(e) => log::error!("[DB] Max Data slot flush failed: {}", e),
+                        }
+                    }
+                }
+            }
+            // ── Process accumulated fragments ──────────────────────────────────
             let n = frag_acc.fragment_count();
             if n > 0 {
                 log::info!("[ACCUM] Slot boundary — processing {} cross-slot fragments", n);

@@ -2,10 +2,8 @@
 High-performance FSK441 meteor scatter transceiver for macOS, Linux and Windows.
 Developed by Roger Banks GW4WND
 
-HEAD
 Developed by Roger Banks GW4WND
 
- 013ff11 (v0.1.13: TX Audio gating)
 ![FSK441plus Screenshot](Screenshot.png)
 
 ## Features
