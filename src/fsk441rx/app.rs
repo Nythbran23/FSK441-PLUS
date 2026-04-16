@@ -2894,6 +2894,27 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
                 // Timeout — detect RX→TX slot boundary during audio silence.
                 let is_tx = tx_active.load(std::sync::atomic::Ordering::Relaxed);
                 let in_qso = settings.their_call_hint.is_some();
+
+                // Linux half-duplex MUST be checked BEFORE updating was_transmitting
+                // so the transition is_tx && !was_transmitting is still detectable.
+                #[cfg(target_os = "linux")]
+                if is_tx && !was_transmitting {
+                    log::info!("[AUDIO] Linux: stopping input stream for TX");
+                    let _ = audio_stop_handle.send(());
+                }
+                #[cfg(target_os = "linux")]
+                if !is_tx && was_transmitting {
+                    // 500ms settling delay — ALSA needs time after TX output closes
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    match audio::start_live(_audio_input_device.clone(), _audio_tx_for_restart.clone()).await {
+                        Ok(h) => {
+                            audio_stop_handle = h;
+                            log::info!("[AUDIO] Linux: input stream restarted after TX");
+                        }
+                        Err(e) => log::error!("[AUDIO] Linux: restart failed: {}", e),
+                    }
+                }
+
                 // Second-pass: save analysis ring at RX→TX boundary when in QSO
                 if is_tx && !was_transmitting && in_qso {
                     if let Some(ref s) = store {
@@ -2913,26 +2934,8 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
                         }
                     }
                 }
+                // Update AFTER checks so transitions are detected correctly
                 if is_tx { was_transmitting = true; } else { was_transmitting = false; }
-                // Linux half-duplex: release input stream at TX start so TxEngine
-                // can open the same ALSA device for output. Restart after TX ends.
-                #[cfg(target_os = "linux")]
-                if is_tx && !was_transmitting {
-                    log::info!("[AUDIO] Linux: stopping input stream for TX");
-                    let _ = audio_stop_handle.send(());
-                }
-                #[cfg(target_os = "linux")]
-                if !is_tx && was_transmitting {
-                    // 500ms settling delay — ALSA needs time after TX output closes
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    match audio::start_live(_audio_input_device.clone(), _audio_tx_for_restart.clone()).await {
-                        Ok(h) => {
-                            audio_stop_handle = h;
-                            log::info!("[AUDIO] Linux: input stream restarted after TX");
-                        }
-                        Err(e) => log::error!("[AUDIO] Linux: restart failed: {}", e),
-                    }
-                }
                 continue;
             }
         };
