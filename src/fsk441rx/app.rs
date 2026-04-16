@@ -3174,6 +3174,12 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
                 validity_score:  parsed.validity_score,
                 raw_decode:      result.raw_decode.clone(),
                 char_probs:      result.char_probs.clone(),
+                // Per-dit tone energies for Doppler rate analysis
+                // Stored for every ping that enters the analysis ring —
+                // the capture gate already governs what gets here.
+                tone_energies:   result.soft_dits.iter()
+                    .map(|d| d.energies)
+                    .collect(),
             };
             analysis_ring.push_back(ap);
             while analysis_ring.len() > RING_MAX {

@@ -19,7 +19,7 @@ use crate::detector::DetectedPing;
 use crate::demod::DemodResult;
 use crate::filter::ParsedMessage;
 
-/// One entry in the analysis ring buffer — metadata + char_probs soft data
+/// One entry in the analysis ring buffer — metadata + soft data for Doppler and second-pass
 #[derive(Clone)]
 pub struct AnalysisPing {
     pub detected_at:     String,
@@ -29,6 +29,11 @@ pub struct AnalysisPing {
     pub validity_score:  u8,
     pub raw_decode:      String,
     pub char_probs:      Vec<[f32; 48]>,
+    /// Per-dit tone energy vectors Vec<[f32; 4]>, one entry per FSK441 dit.
+    /// Used for intra-ping Doppler rate measurement: argmax(energies[i]) gives
+    /// the dominant tone at each dit position; drift across the burst encodes
+    /// the radial velocity change of the meteor trail.
+    pub tone_energies:   Vec<[f32; 4]>,
 }
 
 pub struct Store {
@@ -118,6 +123,17 @@ impl Store {
                 ON analysis_pings(capture_id, detected_at);
         ").context("Database migration v2")?;
 
+        // v3: per-dit tone energy vectors for Doppler analysis (2026-04-16)
+        // ALTER TABLE ignores if column already exists via the error-swallow pattern
+        let _ = conn.execute_batch(
+            "ALTER TABLE analysis_pings ADD COLUMN tone_energies BLOB;"
+        );
+        // Also start storing soft_dits in pings table (was always NULL previously)
+        // soft_dits column already exists in schema — just ensure it's there
+        let _ = conn.execute_batch(
+            "ALTER TABLE pings ADD COLUMN soft_dits BLOB;"
+        );
+
         Ok(Self { conn })
     }
 
@@ -144,15 +160,21 @@ impl Store {
             let blob: Vec<u8> = e.char_probs.iter()
                 .flat_map(|row| row.iter().flat_map(|&f| f.to_le_bytes()))
                 .collect();
+            // Serialise tone_energies: Vec<[f32;4]> → flat f32 bytes LE
+            // n_dits × 4 tones × 4 bytes — encodes per-dit spectral fingerprint
+            let tone_blob: Vec<u8> = e.tone_energies.iter()
+                .flat_map(|row| row.iter().flat_map(|&f| f.to_le_bytes()))
+                .collect();
             self.conn.execute(
                 "INSERT INTO analysis_pings
                  (capture_id, captured_at, detected_at, df_hz, ccf_ratio,
-                  mean_confidence, validity_score, raw_decode, char_probs)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                  mean_confidence, validity_score, raw_decode, char_probs, tone_energies)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 rusqlite::params![
                     capture_id, captured_at, e.detected_at, e.df_hz,
                     e.ccf_ratio, e.mean_confidence, e.validity_score,
                     e.raw_decode, blob,
+                    if tone_blob.is_empty() { None } else { Some(tone_blob) },
                 ],
             )?;
         }
@@ -187,8 +209,16 @@ impl Store {
         result:     &DemodResult,
         parsed:     &ParsedMessage,
     ) -> Result<i64> {
-        // soft_dits NOT stored — 3.5KB/ping = 1GB+ at scale
-        let soft_blob: Option<Vec<u8>> = None;
+        // Store soft_dits tone energies for every ping that reaches insert_ping —
+        // the should_store gate in run_engine already made the decision to store.
+        // No secondary gate here: if the ping is worth storing, its energies are too.
+        let soft_blob: Option<Vec<u8>> = if result.soft_dits.is_empty() {
+            None
+        } else {
+            Some(result.soft_dits.iter()
+                .flat_map(|d| d.energies.iter().flat_map(|&f| f.to_le_bytes()))
+                .collect())
+        };
 
         self.conn.execute(
             "INSERT INTO pings (

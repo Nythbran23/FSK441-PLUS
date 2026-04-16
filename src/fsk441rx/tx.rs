@@ -761,12 +761,18 @@ impl TxEngine {
             HamlibClient::new(addr.clone(), self.hamlib_update_tx.clone())
         });
 
-        // ── Persistent output stream on dedicated thread (all platforms) ────────
-        // Stream lives for the full engine lifetime — never closed between TX slots.
-        // This eliminates the ~2s CoreAudio USB teardown latency on macOS.
+        // ── Persistent output stream on dedicated thread (macOS + Windows) ────
+        // On Linux, ALSA USB audio is half-duplex — input and output cannot both
+        // be open on the same device simultaneously. The Linux path uses open/close
+        // per-slot (play_audio_blocking fallback) with the input stream stopped
+        // at TX start and restarted after TX ends (see run_engine Linux cfg blocks).
+        // On macOS/Windows the persistent stream eliminates the ~2s teardown latency.
+        #[cfg(not(target_os = "linux"))]
         let persistent_audio_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>> = {
             open_persistent_output_stream(self.output_device.clone())
         };
+        #[cfg(target_os = "linux")]
+        let persistent_audio_tx: Option<std::sync::mpsc::SyncSender<Vec<f32>>> = None;
 
         let mut current: Option<TxCommand> = None;
         let mut tx_count = 0u8;
@@ -1000,6 +1006,15 @@ impl TxEngine {
                 PttMethod::Vox => {}
             }
             let _ = self.hamlib_update_tx.send(HamlibUpdate { freq: None, connected: None, transmitting: true });
+
+            // Linux ALSA half-duplex: the RX input stream holds the USB codec device handle.
+            // run_engine receives the transmitting=true event above and stops the RX stream,
+            // but needs time to process the event and for ALSA to release the handle.
+            // Without this delay the TX output stream opens while RX still holds the device,
+            // causing rapid open/close chatter and PTT glitches.
+            // MSK2K uses the same 500ms settling delay (runtime.rs line ~475).
+            #[cfg(target_os = "linux")]
+            tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
 
             let duration_ms = waveform.len() as u64 * 1000 / device_rate as u64;
             let wait_ms = duration_ms + 200; // 200ms tail — samples reach DAC, then PTT drops
