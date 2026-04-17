@@ -146,7 +146,7 @@ async fn start_live_inner(
         native_rate, n_channels, SAMPLE_RATE);
 
     // Check native sample format so we know whether to use f32 or i16 callback
-    let native_format = device.default_input_config()
+    let _native_format = device.default_input_config()
         .map(|c| c.sample_format())
         .unwrap_or(cpal::SampleFormat::F32);
 

@@ -211,7 +211,7 @@ pub struct DecodeEntry {
     second_pass_chars: Vec<(char, bool)>,
 }
 
-enum EngineEvent { Decode(DecodeEntry), Accumulated(AccumulatedDecode), Hamlib(HamlibUpdate), Spectrum(Vec<f32>, f32), AnalysisSaved(i64, usize), SecondPassDecodes(Vec<second_pass::SecondPassResult>), NoiseStats { mean: f32, sigma: f32, threshold: f32 }, ConfUpdate(f32, bool) }
+enum EngineEvent { Decode(DecodeEntry), Accumulated(AccumulatedDecode), Hamlib(HamlibUpdate), Spectrum(Vec<f32>, f32), AnalysisSaved(i64, usize), SecondPassDecodes(Vec<second_pass::SecondPassResult>), NoiseStats { mean: f32, sigma: f32, p99: f32, threshold: f32 }, ConfUpdate(f32, bool) }
 
 
 /// Find cty.dat — checks next to binary first, then current working directory.
@@ -258,7 +258,7 @@ struct Settings {
     max_km:         f64,
     threshold:      f32,
     min_ccf:        f32,   // kept for config backwards compat only
-    k_sigma:        f32,   // sensitivity: threshold = noise_mean + k_sigma * sigma
+    nf_margin:      f32,   // gate margin above noise p99: threshold = noise_p99 + nf_margin
     clear_accumulator: bool,
     their_df_hz:      Option<f32>,
     tx_level:       f32,
@@ -288,10 +288,10 @@ impl Default for Settings {
             max_km:         3000.0,
             threshold:      3.0,
             min_ccf:        200.0,  // legacy — not used in gate
-            k_sigma:        5.0,    // μ + 5σ default
+            nf_margin:      0.04,   // 0.04 above noise p99 — sits in the gap between noise and signal
             clear_accumulator: false,
             their_df_hz: None,
-            tx_level:       1.0,
+            tx_level:       0.1,
             ant_bw_horiz:   40.0,
             ant_bw_vert:    40.0,
             save_max_data:  false,
@@ -509,6 +509,7 @@ struct Fsk441App {
     adif_log:          Vec<QsoRecord>,
     noise_mean:        f32,   // live noise floor mean conf
     noise_sigma:       f32,   // live noise floor sigma
+    noise_p99:         f32,   // live noise floor p99 — gate is p99 + nf_margin
     adaptive_threshold: f32,  // live adaptive conf threshold
     nf_settled:         bool, // EMA has converged — NF label goes green
     // Second-pass decoder
@@ -638,7 +639,8 @@ impl Fsk441App {
         adif_log: Vec::new(),
         noise_mean: 0.44,
         noise_sigma: 0.02,
-        adaptive_threshold: 0.54, // prior: noise_mean(0.44) + k(5) × noise_sigma(0.02)
+        noise_p99: 0.47,   // prior: typical p99 of 4-tone FSK noise
+        adaptive_threshold: 0.51, // prior: noise_p99(0.47) + margin(0.04)
         nf_settled: false,
         wf_amplitude: Vec::new(),
         last_conf: 0.0,
@@ -784,9 +786,10 @@ impl Fsk441App {
                     if self.df_dots.len() > 2000 { self.df_dots.remove(0); }
                     continue;
                 }
-                EngineEvent::NoiseStats { mean, sigma, threshold } => {
+                EngineEvent::NoiseStats { mean, sigma, p99, threshold } => {
                     self.noise_mean = mean;
                     self.noise_sigma = sigma;
+                    self.noise_p99 = p99;
                     self.adaptive_threshold = threshold;
                     continue;
                 }
@@ -1837,8 +1840,9 @@ impl eframe::App for Fsk441App {
                             .color(nf_col)
                             .monospace())
                             .on_hover_text(format!(
-                                "Adaptive noise floor gate\nμ={:.4}  σ={:.4}\n{}\nGreen = EMA settled  Red = still calibrating",
-                                self.noise_mean, self.noise_sigma,
+                                "Adaptive noise gate = p99 + margin\nμ={:.4}  σ={:.4}  p99={:.4}\nGate={:.4}  m={:.3}\n{}",
+                                self.noise_mean, self.noise_sigma, self.noise_p99,
+                                self.adaptive_threshold, self.settings.nf_margin,
                                 if self.nf_settled { "EMA converged" } else { "Warming up — needs more pings" }
                             ));
                         ui.separator();
@@ -1852,24 +1856,24 @@ impl eframe::App for Fsk441App {
                             .monospace())
                             .on_hover_text("Confidence of last decoded ping. Green = above noise gate.");
                         ui.separator();
-                        ui.label(egui::RichText::new("k").color(egui::Color32::from_gray(200)).monospace())
+                        ui.label(egui::RichText::new("m").color(egui::Color32::from_gray(200)).monospace())
                             .on_hover_text(
-                                "Detection sensitivity — sole threshold control.\n\
-                                 Gate = noise_mean + k × sigma\n\
-                                 Noise floor is measured automatically from band conditions.\n\n\
-                                 k=5 (default): good balance for meteor scatter\n\
-                                 Lower k: more sensitive, more noise visible\n\
-                                 Higher k: cleaner display, may miss marginal pings"
+                                "Detection sensitivity — margin above noise p99.\n\
+                                 Gate = noise_p99 + m\n\
+                                 Noise ceiling is measured automatically from band conditions.\n\n\
+                                 m=0.04 (default): optimal for meteor scatter\n\
+                                 Lower m: more sensitive, closer to noise ceiling\n\
+                                 Higher m: cleaner display, may miss marginal pings\n\n\
+                                 The gap between noise max and signal min is ~0.05,\n\
+                                 so m=0.04 sits in the middle of that gap."
                             );
-                        let k_resp = ui.add(egui::Slider::new(&mut self.settings.k_sigma, 2.0..=10.0)
-                            .fixed_decimals(1))
+                        let k_resp = ui.add(egui::Slider::new(&mut self.settings.nf_margin, 0.01..=0.15)
+                            .fixed_decimals(2))
                             .on_hover_text(
-                                "Detection sensitivity — sole threshold control.\n\
-                                 Gate = noise_mean + k × sigma\n\
-                                 Noise floor is measured automatically from band conditions.\n\n\
-                                 k=5 (default): good balance for meteor scatter\n\
-                                 Lower k: more sensitive, more noise visible\n\
-                                 Higher k: cleaner display, may miss marginal pings"
+                                "Detection sensitivity — margin above noise p99.\n\
+                                 Gate = noise_p99 + m\n\
+                                 m=0.04 default: optimal for meteor scatter\n\
+                                 Lower = more sensitive, Higher = cleaner"
                             );
                         if k_resp.changed() {
                             let _ = self.settings_watch_tx.send(self.settings.clone());
@@ -2261,6 +2265,14 @@ impl eframe::App for Fsk441App {
                         let header = format!("{:<10} {:>+7.0} {:>7}  ",
                             e.timestamp.format("%H:%M:%S"), e.df_hz, dur_str);
 
+                        // Slot parity: which 30s TX/RX period did this ping arrive in?
+                        // Even slot = slightly warm tint, Odd slot = slightly cool tint.
+                        // Subtle enough not to distract but lets you see at a glance
+                        // which fragments could be from the same transmission period.
+                        // Not applied in QSO mode (their_call_hint set) or second-pass.
+                        let slot_parity = (e.timestamp.timestamp() / 30) % 2;
+                        let in_qso = self.settings.their_call_hint.is_some();
+
                         // Render row with click detection via allocate_rect
                         let row_start = ui.cursor().min;
                         ui.horizontal(|ui| {
@@ -2273,12 +2285,24 @@ impl eframe::App for Fsk441App {
                                     egui::Color32::from_rgba_unmultiplied(255,255,255,18));
                             }
 
-                            // Header in dim grey monospace (italic cyan for second pass)
+                            // Header: dim grey normally, but timestamp subtly tinted by slot
+                            // when not in QSO and not a second-pass decode.
                             let header_rt = if e.is_second_pass {
                                 egui::RichText::new(&header)
                                     .monospace()
                                     .italics()
                                     .color(egui::Color32::from_rgb(80, 200, 220))
+                            } else if !in_qso {
+                                // Slot 0: faint warm amber tint on timestamp
+                                // Slot 1: faint cool blue tint on timestamp
+                                let ts_col = if slot_parity == 0 {
+                                    egui::Color32::from_rgb(190, 170, 140) // warm grey
+                                } else {
+                                    egui::Color32::from_rgb(140, 160, 190) // cool grey
+                                };
+                                egui::RichText::new(&header)
+                                    .monospace()
+                                    .color(ts_col)
                             } else {
                                 egui::RichText::new(&header)
                                     .monospace()
@@ -2856,30 +2880,46 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
     let mut analysis_ring: std::collections::VecDeque<AnalysisPing> = std::collections::VecDeque::with_capacity(RING_MAX);
 
     // ── Adaptive noise floor tracker ─────────────────────────────────────────
-    // EMA of mean_confidence for pings below current threshold (noise only).
-    // α=0.001 → time constant ~1000 pings ≈ 3 minutes at typical ping rates.
-    // Only pings BELOW current adaptive_conf_threshold feed the EMA, so real
-    // signal bursts and interference spikes don't contaminate the noise estimate.
+    // Tracks two quantities from the noise distribution:
+    //   1. noise_mean / noise_var — EMA of mean and variance (for display)
+    //   2. noise_p99 — direct tracker of the 99th percentile upper tail
     //
-    // threshold = noise_mean + k_sigma × noise_sigma
+    // Gate = noise_p99 + nf_margin
     //
-    // This is mathematically derived: mean_confidence = (best-second)/best for
-    // 4-tone FSK, where noise energies are i.i.d. exponential. The EMA measures
-    // the actual distribution on the operator's band and k_sigma is the sole
-    // operator control — no hardcoded floor needed or justified.
-    const EMA_ALPHA:    f32 = 0.001;
-    let mut noise_mean:     f32 = 0.44;   // prior: E[normalised margin] for 4-tone noise
-    let mut noise_var:      f32 = 0.0004; // prior: σ² ≈ 0.02²
-    // Cold-start threshold from priors: 0.44 + 5×0.02 = 0.54
-    // Once EMA warms up it takes over completely.
-    let mut adaptive_conf_threshold: f32 =
-        noise_mean + settings.k_sigma * noise_var.sqrt();
+    // This is more robust than mean + k×sigma because:
+    //   - p99 directly measures "the top of the noise" without assuming Gaussian
+    //   - Margin is in absolute confidence units (0.04 = 4% above noise ceiling)
+    //   - Gate cannot drift into signal territory even if σ inflates due to
+    //     interference, whereas k×σ could push the gate arbitrarily high
+    //
+    // Asymmetric update: p99 rises slowly (signal pings don't contaminate it),
+    // falls faster (so a drop in band noise is tracked promptly).
+    //
+    // nf_margin (default 0.04) is the operator control — the sole knob.
+    // The data shows noise p99 ≈ 0.47, signal min ≈ 0.53: gap of 0.06.
+    // margin=0.04 sits comfortably in that gap.
+    const EMA_ALPHA:       f32 = 0.001;
+    const P99_ALPHA_UP:    f32 = 0.0005;  // slow rise — don't let signal pings inflate p99
+    const P99_ALPHA_DOWN:  f32 = 0.002;   // faster fall — track noise floor dropping
+    let mut noise_mean:    f32 = 0.44;    // prior: E[normalised margin] for 4-tone noise
+    let mut noise_var:     f32 = 0.0004;  // prior: σ² ≈ 0.02²
+    let mut noise_p99:     f32 = 0.47;    // prior: typical p99 from session data
+    let mut adaptive_conf_threshold: f32 = noise_p99 + settings.nf_margin;
     let mut ema_ping_count: u32 = 0;
     const EMA_WARMUP_PINGS: u32 = 500;
     // Brief startup delay — allow audio stream to stabilise before accepting pings
     let engine_start = std::time::Instant::now();
     const STARTUP_MS: u128 = 3000;
     let mut was_transmitting = false;
+
+    // ── Display deduplication tracker ────────────────────────────────────────
+    // Within a 1-second window at the same DF bucket, only show a new ping if
+    // its CCF is substantially better than the last displayed one at that DF.
+    // Prevents burst flooding where the 500ms sliding detector fires 4-5
+    // overlapping windows per second for the same trail. Accumulator is
+    // unaffected — all pings still reach it regardless.
+    let mut df_display_tracker: std::collections::HashMap<i32, (std::time::Instant, f32)> =
+        std::collections::HashMap::new();
 
     loop {
         // Use a timeout so we wake up periodically during TX even when
@@ -2950,8 +2990,10 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
             if settings.qsy_reset {
                 noise_mean = 0.44;
                 noise_var  = 0.0004;
+                noise_p99  = 0.47;
                 ema_ping_count = 0;
-                adaptive_conf_threshold = noise_mean + settings.k_sigma * noise_var.sqrt();
+                adaptive_conf_threshold = noise_p99 + settings.nf_margin;
+                df_display_tracker.clear();
                 log::info!("[NOISE] EMA reset after QSY — restarting noise floor measurement");
             }
 
@@ -3064,21 +3106,28 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
         }
 
         // ── Adaptive noise floor update ──────────────────────────────────────
-        // Only pings below current threshold feed the EMA — self-protecting
+        // Only pings below current threshold feed the trackers — self-protecting
         // against signal contamination and interference spikes.
         let conf = result.mean_confidence;
         if conf < adaptive_conf_threshold {
+            // Update mean/variance EMA (for display and settled detection)
             let delta = conf - noise_mean;
             noise_mean += EMA_ALPHA * delta;
             noise_var   = (1.0 - EMA_ALPHA) * (noise_var + EMA_ALPHA * delta * delta);
             ema_ping_count += 1;
 
-            // Once warmed up, let the EMA drive the threshold
-            if ema_ping_count >= EMA_WARMUP_PINGS {
-                let noise_sigma = noise_var.sqrt();
-                adaptive_conf_threshold = (noise_mean + settings.k_sigma * noise_sigma)
-                    .min(0.90);
+            // Update p99 tracker with asymmetric alpha
+            // Rises slowly so signal pings don't contaminate it;
+            // falls faster so a quieter band is tracked promptly.
+            if conf > noise_p99 {
+                noise_p99 += P99_ALPHA_UP   * (conf - noise_p99);
+            } else {
+                noise_p99 += P99_ALPHA_DOWN * (conf - noise_p99);
             }
+
+            // Gate = p99 + operator margin. Active immediately — no warmup needed
+            // since the prior (0.47 + 0.04 = 0.51) is already a safe starting point.
+            adaptive_conf_threshold = (noise_p99 + settings.nf_margin).min(0.90);
         }
 
         // Settled = warmed up AND σ/μ < 8% — EMA has converged on this band's noise floor.
@@ -3093,10 +3142,11 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
         // Log and report adaptive threshold every ~5 minutes
         if ema_ping_count > 0 && ema_ping_count % 1500 == 0 {
             let noise_sigma = noise_var.sqrt();
-            log::info!("[NOISE] μ={:.4} σ={:.4} threshold={:.4} k={:.1}",
-                noise_mean, noise_sigma, adaptive_conf_threshold, settings.k_sigma);
+            log::info!("[NOISE] μ={:.4} σ={:.4} p99={:.4} gate={:.4} margin={:.3}",
+                noise_mean, noise_sigma, noise_p99, adaptive_conf_threshold, settings.nf_margin);
             let _ = event_tx.send(EngineEvent::NoiseStats {
                 mean: noise_mean, sigma: noise_sigma,
+                p99: noise_p99,
                 threshold: adaptive_conf_threshold,
             });
         }
@@ -3156,18 +3206,48 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
 
         let show = threshold_pass || content_override;
 
-        // ── Display gate ──────────────────────────────────────────────────────
-        // RAW mode = MSHV-equivalent: show what WSJT would show
-        // Normal mode = our pipeline
-        // In both cases threshold_pass drives colour coding
+        // ── Display filters (accumulator is already fed above, unaffected) ────
+        //
+        // Filter 1 — weak-ping gate: isolated short pings with low CCF (<50)
+        // are often noise that scraped over the confidence gate. For these we
+        // require a higher confidence floor (gate + 0.08, capped at 0.65).
+        // This correctly passes R16 (conf=0.649) and R36/ (conf=0.667) which
+        // sit above the raised floor, while blocking garbage like ?WLEV (0.555).
+        // Pings with CCF>=50 use the normal adaptive gate — they have enough
+        // FSK441 energy to be self-validating.
+        let min_conf_for_display = if ping.ccf_ratio < 50.0 {
+            (adaptive_conf_threshold + 0.08).min(0.65)
+        } else {
+            adaptive_conf_threshold
+        };
+        let weak_ping_ok = conf >= min_conf_for_display;
+
+        // Filter 2 — DF burst deduplication: the 500ms sliding detector fires
+        // 3-5 overlapping windows per second for the same trail, flooding the
+        // decoded pings list with near-identical rows. Within a 1-second window
+        // at the same DF bucket, only display a ping if its CCF is at least 2×
+        // the last displayed ping at that DF — this captures the trail build-up
+        // profile (each displayed ping is meaningfully stronger than the last)
+        // without showing every redundant intermediate buffer.
+        let df_bucket = (ping.df_hz / 43.0).round() as i32;
+        let burst_ok = match df_display_tracker.get(&df_bucket) {
+            None => true,
+            Some((last_time, last_ccf)) => {
+                last_time.elapsed().as_millis() > 1000
+                || ping.ccf_ratio > last_ccf * 2.0
+            }
+        };
+
+        if !show || !weak_ping_ok || !burst_ok { continue; }
+
+        // Update deduplication tracker for this DF bucket
+        df_display_tracker.insert(df_bucket, (std::time::Instant::now(), ping.ccf_ratio));
+
         // Add to analysis ring buffer — captures pings near threshold for second-pass.
-        // Capture gate is deliberately LOWER than the display gate: we want to catch
-        // pings that just miss the display cut but still carry char_probs energy.
-        // Use K-1.5σ (min 0.5σ) so the ring gate tracks the user's K slider
-        // automatically — no separate control needed.
-        let noise_sigma_now = noise_var.sqrt();
-        let capture_k = (settings.k_sigma - 1.5_f32).max(0.5);
-        let capture_gate_conf = noise_mean + capture_k * noise_sigma_now;
+        // Ring gate sits below the display gate so we capture pings that just miss
+        // the display cut but still carry char_probs energy.
+        // Use noise_p99 - 0.02 so the ring gate is always slightly below the display gate.
+        let capture_gate_conf = (noise_p99 - 0.02).max(0.40);
         if conf >= capture_gate_conf && !result.char_probs.is_empty() {
             let ap = AnalysisPing {
                 detected_at:     ping.timestamp.to_rfc3339(),
@@ -3189,8 +3269,6 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
                 analysis_ring.pop_front();
             }
         }
-
-        if !show { continue; }
 
         // Per-character confidence: max of each char's 48-element prob array
         let char_confs: Vec<f32> = result.char_probs.iter()
@@ -3238,7 +3316,7 @@ fn save_config(s: &Settings) {
         PttMethod::VoxOnly   => "vox",
     };
     let data = format!(
-        "my_call={}\nmy_loc={}\ninput={}\noutput={}\nrig_model={}\nrig_port={}\nrig_baud={}\nhamlib_enabled={}\nperiod={}\ncty_path={}\nmax_km={}\nmin_ccf={}\ntx_level={}\nant_bw_horiz={}\nant_bw_vert={}\nk_sigma={}\nsave_max_data={}\nptt_method={}\nptt_serial_port={}\n",
+        "my_call={}\nmy_loc={}\ninput={}\noutput={}\nrig_model={}\nrig_port={}\nrig_baud={}\nhamlib_enabled={}\nperiod={}\ncty_path={}\nmax_km={}\nmin_ccf={}\ntx_level={}\nant_bw_horiz={}\nant_bw_vert={}\nnf_margin={}\nsave_max_data={}\nptt_method={}\nptt_serial_port={}\n",
         s.my_call,
         s.my_loc,
         s.sel_in.as_deref().unwrap_or(""),
@@ -3254,7 +3332,7 @@ fn save_config(s: &Settings) {
         s.tx_level,
         s.ant_bw_horiz,
         s.ant_bw_vert,
-        s.k_sigma,
+        s.nf_margin,
         s.save_max_data,
         ptt_method_str,
         s.ptt_serial_port,
@@ -3292,10 +3370,11 @@ fn load_config() -> Settings {
             "max_km"         => s.max_km    = v.parse().unwrap_or(3000.0),
             "min_ccf"        => s.min_ccf   = v.parse().unwrap_or(200.0),  // legacy
             "min_conf"       => {}  // legacy — removed; EMA derives threshold automatically
-            "tx_level"       => s.tx_level  = v.parse().unwrap_or(1.0),
+            "tx_level"       => s.tx_level  = v.parse().unwrap_or(0.1),
             "ant_bw_horiz"   => s.ant_bw_horiz = v.parse().unwrap_or(40.0),
             "ant_bw_vert"    => s.ant_bw_vert   = v.parse().unwrap_or(40.0),
-            "k_sigma"        => s.k_sigma       = v.parse().unwrap_or(5.0),
+            "k_sigma"        => s.nf_margin = (v.parse::<f32>().unwrap_or(5.0) * 0.016).clamp(0.01, 0.15),  // legacy: convert k×σ to margin
+            "nf_margin"      => s.nf_margin  = v.parse().unwrap_or(0.04),
             "arm2_ccf"       => {}  // legacy — silently ignored
             "arm2_conf"      => {}  // legacy — silently ignored
             "save_max_data"  => s.save_max_data  = v == "true",
