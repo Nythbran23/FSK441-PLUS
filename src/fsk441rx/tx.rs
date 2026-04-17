@@ -504,7 +504,9 @@ fn play_audio_blocking(samples: Vec<f32>, device_name: Option<String>, cancel: s
                             for i in 0..take {
                                 let s = (remainder[i].clamp(-1.0, 1.0) * 32767.0) as i16;
                                 for ch in 0..channels {
-                                    out[(filled + i) * channels + ch] = if ch == 0 { s } else { 0 };
+                                    // Write same audio to all channels — IC-7300 may use
+                                    // either or both channels for USB modulation input
+                                    out[(filled + i) * channels + ch] = s;
                                 }
                             }
                             remainder.drain(..take);
