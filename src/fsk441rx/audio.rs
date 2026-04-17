@@ -86,9 +86,7 @@ async fn start_live_inner(
             |e| log::error!("[AUDIO] Stream error: {}", e),
             None,
         ).or_else(|_| {
-            // Fallback: try default config
-            let _default_cfg = device.default_input_config()
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            // Fallback 1: try default buffer size with f32
             let fallback = cpal::StreamConfig {
                 channels: 1,
                 sample_rate: cpal::SampleRate(SAMPLE_RATE),
@@ -98,6 +96,24 @@ async fn start_live_inner(
             device.build_input_stream(
                 &fallback,
                 move |data: &[f32], _| { let _ = tx2.send(data.to_vec()); },
+                |e| log::error!("[AUDIO] Stream error: {}", e),
+                None,
+            ).map_err(|e| anyhow::anyhow!("{}", e))
+        }).or_else(|_| {
+            // Fallback 2: i16 format (IC-7300 / Linux ALSA S16_LE devices)
+            log::warn!("[AUDIO] f32 failed at 11025Hz, trying i16");
+            let fallback = cpal::StreamConfig {
+                channels: 1,
+                sample_rate: cpal::SampleRate(SAMPLE_RATE),
+                buffer_size: cpal::BufferSize::Default,
+            };
+            let tx3 = tx.clone();
+            device.build_input_stream(
+                &fallback,
+                move |data: &[i16], _| {
+                    let converted: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
+                    let _ = tx3.send(converted);
+                },
                 |e| log::error!("[AUDIO] Stream error: {}", e),
                 None,
             ).map_err(|e| anyhow::anyhow!("{}", e))
@@ -123,10 +139,16 @@ async fn start_live_inner(
         return Ok(());
     }
 
-    // ── Fallback path: device has different rate (e.g. BlackHole at 44100/48000) ──
-    // Only used for loopback testing — does NOT affect normal IC-9700 operation.
-    log::info!("[AUDIO] Capturing at {} Hz, {} ch → resampling to {} Hz mono (test mode)",
+    // ── Fallback path: device has different rate (e.g. IC-7300 at 44100Hz, BlackHole) ──
+    // On Linux the IC-7300 CODEC reports 44100Hz and only supports S16_LE format.
+    // We try f32 first; if the device rejects it (ALSA error 22) we fall back to i16.
+    log::info!("[AUDIO] Capturing at {} Hz, {} ch → resampling to {} Hz mono",
         native_rate, n_channels, SAMPLE_RATE);
+
+    // Check native sample format so we know whether to use f32 or i16 callback
+    let native_format = device.default_input_config()
+        .map(|c| c.sample_format())
+        .unwrap_or(cpal::SampleFormat::F32);
 
     let stream_cfg = cpal::StreamConfig {
         channels:    n_channels as u16,
@@ -135,40 +157,69 @@ async fn start_live_inner(
     };
 
     let (raw_tx, mut raw_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
-
-    // CoreAudio Stream is !Send+!Sync — must build and keep on the same thread.
-    // Use a std channel to confirm the stream started, then block the thread.
     let (started_tx, started_rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
     let ch = n_channels;
 
+    let raw_tx2 = raw_tx.clone();
+    let cfg2 = stream_cfg.clone();
+
     std::thread::spawn(move || {
-        use cpal::traits::DeviceTrait;
-        let raw_tx2 = raw_tx;
-        let stream = device.build_input_stream(
-            &stream_cfg,
+        use cpal::traits::{DeviceTrait, StreamTrait};
+
+        // Try f32 first; fall back to i16 if device rejects float format
+        let stream_result: Result<cpal::Stream, _> = device.build_input_stream(
+            &cfg2,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                let mono: Vec<f32> = if ch == 1 {
-                    data.to_vec()
-                } else {
-                    data.chunks(ch).map(|f| f.iter().sum::<f32>() / ch as f32).collect()
-                };
+                let mono: Vec<f32> = if ch == 1 { data.to_vec() }
+                    else { data.chunks(ch).map(|f| f.iter().sum::<f32>() / ch as f32).collect() };
                 let _ = raw_tx2.send(mono);
             },
             |e| log::error!("[AUDIO] Stream error: {}", e),
             None,
         );
-        match stream {
+
+        let stream = match stream_result {
             Ok(s) => {
-                if let Err(e) = { use cpal::traits::StreamTrait; let s: &cpal::Stream = &s; s.play() } {
-                    let _ = started_tx.send(Err(anyhow::anyhow!("play: {}", e)));
-                    return;
-                }
-                let _ = started_tx.send(Ok(()));
-                // Keep stream alive — block this thread
-                loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
+                log::info!("[AUDIO] Input stream opened with f32 format");
+                s
             }
-            Err(e) => { let _ = started_tx.send(Err(anyhow::anyhow!("build: {}", e))); }
+            Err(e) => {
+                log::warn!("[AUDIO] f32 input failed ({}), trying i16 (IC-7300/Linux ALSA)", e);
+                // i16 path — convert to f32 in callback
+                let raw_tx3 = raw_tx;
+                match device.build_input_stream(
+                    &cfg2,
+                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        let mono: Vec<f32> = if ch == 1 {
+                            data.iter().map(|&s| s as f32 / 32768.0).collect()
+                        } else {
+                            data.chunks(ch).map(|f| {
+                                f.iter().map(|&s| s as i32).sum::<i32>() as f32 / (32768.0 * ch as f32)
+                            }).collect()
+                        };
+                        let _ = raw_tx3.send(mono);
+                    },
+                    |e| log::error!("[AUDIO] Stream error: {}", e),
+                    None,
+                ) {
+                    Ok(s) => { log::info!("[AUDIO] Input stream opened with i16 format"); s }
+                    Err(e2) => { let _ = started_tx.send(Err(anyhow::anyhow!("build i16: {}", e2))); return; }
+                }
+            }
+        };
+
+        if let Err(e) = stream.play() {
+            let _ = started_tx.send(Err(anyhow::anyhow!("play: {}", e)));
+            return;
         }
+        let _ = started_tx.send(Ok(()));
+
+        // Linux: block until stop signal (half-duplex release)
+        #[cfg(target_os = "linux")]
+        { let _ = stop_rx.recv(); log::info!("[AUDIO] Linux: resampling input stream released"); }
+        // macOS/Windows: keep alive forever
+        #[cfg(not(target_os = "linux"))]
+        { let _ = stop_rx; loop { std::thread::sleep(std::time::Duration::from_secs(3600)); } }
     });
 
     started_rx.recv()

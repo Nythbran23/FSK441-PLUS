@@ -423,6 +423,9 @@ fn play_audio_blocking(samples: Vec<f32>, device_name: Option<String>, cancel: s
     // Callback serves silence once channel is exhausted — no abrupt teardown.
     let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(2);
 
+    // Keep a clone for the i16 fallback path — only used if f32 output fails
+    let samples_for_i16 = samples.clone();
+
     // Send samples in chunks matching the buffer size so the channel stays responsive
     {
         let audio_tx2 = audio_tx.clone();
@@ -464,7 +467,6 @@ fn play_audio_blocking(samples: Vec<f32>, device_name: Option<String>, cancel: s
                     remainder.drain(..take);
                     filled += take;
                 }
-                // Silence any unfilled frames
                 out[filled * channels..].fill(0.0);
             }
         },
@@ -472,7 +474,52 @@ fn play_audio_blocking(samples: Vec<f32>, device_name: Option<String>, cancel: s
         None,
     ) {
         Ok(s) => s,
-        Err(e) => { log::error!("[TX] build_output_stream: {}", e); return; }
+        Err(e) => {
+            // f32 output rejected — try i16 (IC-7300/Linux ALSA S16_LE only)
+            log::warn!("[TX] f32 output failed ({}), trying i16 format", e);
+            let (audio_tx2, audio_rx2) = std::sync::mpsc::sync_channel::<Vec<f32>>(2);
+            {
+                let samples2 = samples_for_i16;
+                std::thread::spawn(move || {
+                    for chunk in samples2.chunks(AUDIO_BUFFER_SIZE as usize) {
+                        if audio_tx2.send(chunk.to_vec()).is_err() { break; }
+                    }
+                });
+            }
+            match device.build_output_stream(
+                &stream_config,
+                {
+                    let mut remainder: Vec<f32> = Vec::new();
+                    move |out: &mut [i16], _| {
+                        let frames = out.len() / channels;
+                        let mut filled = 0;
+                        while filled < frames {
+                            if remainder.is_empty() {
+                                match audio_rx2.try_recv() {
+                                    Ok(chunk) => remainder = chunk,
+                                    Err(_) => break,
+                                }
+                            }
+                            let take = (frames - filled).min(remainder.len());
+                            for i in 0..take {
+                                let s = (remainder[i].clamp(-1.0, 1.0) * 32767.0) as i16;
+                                for ch in 0..channels {
+                                    out[(filled + i) * channels + ch] = if ch == 0 { s } else { 0 };
+                                }
+                            }
+                            remainder.drain(..take);
+                            filled += take;
+                        }
+                        for i in filled * channels..out.len() { out[i] = 0; }
+                    }
+                },
+                |e| log::error!("[TX] Output error (i16): {}", e),
+                None,
+            ) {
+                Ok(s) => { log::info!("[TX] Output stream opened with i16 format"); s }
+                Err(e2) => { log::error!("[TX] build_output_stream i16: {}", e2); return; }
+            }
+        }
     };
 
     if let Err(e) = stream.play() {
