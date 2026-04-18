@@ -77,6 +77,14 @@ pub struct QsoContext {
     /// When true, do NOT delete analysis_pings after scoring — retained for off-line analysis.
     /// Set from Settings::save_max_data.
     pub retain_after_run: bool,
+    /// When true, load ALL analysis_pings regardless of capture_id —
+    /// accumulates evidence across all RX periods since QSO start.
+    /// When false (Idle), only the current capture window is scored.
+    pub qso_active: bool,
+    /// RFC3339 timestamp of when the current QSO started (SET pressed / first TX).
+    /// Used to filter analysis_pings to only this QSO's data.
+    /// None = no filter (load all).
+    pub qso_started_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -220,20 +228,175 @@ pub fn generate_hypotheses(ctx: &QsoContext) -> Vec<String> {
     h
 }
 
-// ─── Blob scoring ─────────────────────────────────────────────────────────────
+// ─── Accumulated probability vector ───────────────────────────────────────────
 
-/// Score a char_probs blob against one hypothesis message.
+/// Per-position accumulated char_probs summed across multiple pings.
+/// Shape: [n_chars][48] — values are SUM of probabilities across all pings,
+/// NOT normalised. Larger values = more total energy received at that slot.
+struct AccumulatedProbs {
+    /// Summed probabilities: n_chars × 48 f32 values
+    data:    Vec<f32>,
+    /// Number of character positions accumulated
+    n_chars: usize,
+    /// Number of pings summed into this accumulation
+    n_pings: usize,
+}
+
+impl AccumulatedProbs {
+    fn new(n_chars: usize) -> Self {
+        Self { data: vec![0.0; n_chars * 48], n_chars, n_pings: 0 }
+    }
+
+    /// Add one ping's char_probs blob (raw bytes, n × 48 × 4) into accumulation.
+    /// Blobs shorter than n_chars are zero-extended; longer blobs are truncated.
+    fn accumulate(&mut self, blob: &[u8]) {
+        let n_from_blob = blob.len() / (48 * 4);
+        let n = n_from_blob.min(self.n_chars);
+        for i in 0..n {
+            for slot in 0..48 {
+                let byte_off = i * 48 * 4 + slot * 4;
+                if byte_off + 4 > blob.len() { break; }
+                let v = f32::from_le_bytes([
+                    blob[byte_off], blob[byte_off+1],
+                    blob[byte_off+2], blob[byte_off+3],
+                ]);
+                self.data[i * 48 + slot] += v;
+            }
+        }
+        self.n_pings += 1;
+    }
+
+    /// Read accumulated (summed) probability for character position i, slot s.
+    fn get(&self, i: usize, slot: usize) -> f32 {
+        if i >= self.n_chars || slot >= 48 { return 0.0; }
+        self.data[i * 48 + slot]
+    }
+
+    /// Mean accumulated probability across all slots at position i.
+    /// Used as the noise reference: a slot well above this is carrying signal.
+    fn mean_at(&self, i: usize) -> f32 {
+        if i >= self.n_chars { return 0.0; }
+        let base = i * 48;
+        self.data[base..base+48].iter().sum::<f32>() / 48.0
+    }
+}
+
+// ─── Accumulated blob scoring ──────────────────────────────────────────────────
+
+/// Score an AccumulatedProbs vector against one hypothesis message.
 ///
-/// Tries all alignment offsets of the repeating hypothesis (accounts for
-/// the decoder starting mid-message). Returns the best-scoring alignment.
+/// Two-level gate:
+///   1. Character gate: accumulated energy at hypothesis[i]'s slot must exceed
+///      `signal_floor` × n_pings (i.e. average energy per ping above threshold).
+///      This is energy derived from received signal — never invented.
 ///
-/// For each character position i in the blob:
-///   - Predict the character from the hypothesis at offset+i
-///   - Look up that character's slot in the blob
-///   - Read the energy value
-///   - ONLY accept if energy >= noise_floor — never invent
+///   2. Space constraint (trellis framing): the space character (slot 15) acts
+///      as a sync signal in FSK441. At space positions in the hypothesis the
+///      space slot should be elevated; at non-space positions it should not
+///      dominate. This validates alignment independently of character identity.
 ///
-/// Returns (n_confirmed, n_checked, confirmed_chars, best_offset).
+/// Tries all alignment offsets of the repeating hypothesis and returns the
+/// best-scoring one.
+///
+/// Returns (n_confirmed, n_checked, confirmed_chars, space_score, best_offset).
+fn score_accumulated(
+    acc:          &AccumulatedProbs,
+    hypothesis:   &str,
+    signal_floor: f32,  // per-ping threshold (e.g. adaptive_conf_threshold)
+) -> (usize, usize, Vec<(char, f32)>, f32, usize) {
+    if acc.n_chars == 0 || acc.n_pings == 0 {
+        return (0, 0, vec![], 0.0, 0);
+    }
+
+    // The effective gate scales with number of pings accumulated:
+    // if signal_floor=0.51 and we have 10 pings, a character needs
+    // total accumulated energy > 0.51 × 10 = 5.1 to be confirmed.
+    let effective_floor = signal_floor * acc.n_pings as f32;
+
+    // Space slot index
+    const SPACE_SLOT: usize = 15;
+
+    // Repeat hypothesis 3× to cover any phase alignment
+    let rep = format!("{}{}{}", hypothesis, hypothesis, hypothesis);
+    let rep_chars: Vec<char> = rep.chars().collect();
+    let hyp_len = hypothesis.chars().count();
+
+    let mut best_confirmed = 0usize;
+    let mut best_checked   = 0usize;
+    let mut best_chars:    Vec<(char, f32)> = Vec::new();
+    let mut best_space_score = 0.0f32;
+    let mut best_offset    = 0usize;
+
+    for offset in 0..hyp_len {
+        let mut confirmed = 0usize;
+        let mut checked   = 0usize;
+        let mut chars: Vec<(char, f32)> = Vec::new();
+        let mut space_score = 0.0f32;
+        let mut space_checked = 0usize;
+
+        for i in 0..acc.n_chars {
+            let t_idx = offset + i;
+            if t_idx >= rep_chars.len() { break; }
+            let c = rep_chars[t_idx];
+
+            let slot = match char_to_slot(c) {
+                Some(s) => s,
+                None    => continue,
+            };
+
+            let energy = acc.get(i, slot);
+
+            // ── Space constraint (trellis framing) ────────────────────────
+            // At each position, the space slot energy tells us whether this
+            // position carries a space character. This is independent of what
+            // character we're predicting — it validates the hypothesis framing.
+            let space_energy = acc.get(i, SPACE_SLOT);
+            let mean_energy  = acc.mean_at(i);
+            if mean_energy > 0.0 {
+                let space_relative = space_energy / (mean_energy * 48.0);
+                if c == ' ' {
+                    // Space expected: reward if space slot is elevated
+                    space_score += space_relative;
+                } else {
+                    // Non-space expected: reward if space slot is suppressed
+                    space_score += 1.0 - space_relative;
+                }
+                space_checked += 1;
+            }
+
+            // ── Character gate ─────────────────────────────────────────────
+            // Only accept if accumulated energy exceeds scaled floor.
+            // This is received signal energy — never invented.
+            checked += 1;
+            if energy >= effective_floor {
+                confirmed += 1;
+                // Report mean energy per ping for display
+                chars.push((c, energy / acc.n_pings as f32));
+            }
+        }
+
+        // Normalise space score to [0,1]
+        let norm_space = if space_checked > 0 {
+            space_score / space_checked as f32
+        } else { 0.0 };
+
+        // Primary sort: confirmed characters (real energy)
+        // Secondary: space framing score (alignment validation)
+        if confirmed > best_confirmed
+            || (confirmed == best_confirmed && norm_space > best_space_score)
+        {
+            best_confirmed   = confirmed;
+            best_checked     = checked;
+            best_chars       = chars;
+            best_space_score = norm_space;
+            best_offset      = offset;
+        }
+    }
+
+    (best_confirmed, best_checked, best_chars, best_space_score, best_offset)
+}
+
+/// Legacy single-blob scorer — kept for tests and fallback use.
 fn score_blob(
     blob:        &[u8],
     hypothesis:  &str,
@@ -241,67 +404,10 @@ fn score_blob(
 ) -> (usize, usize, Vec<(char, f32)>, usize) {
     let n_pos = blob.len() / (48 * 4);
     if n_pos == 0 { return (0, 0, vec![], 0); }
-
-    // Repeat hypothesis to cover any alignment within a full message cycle
-    let rep = format!("{}{}{}", hypothesis, hypothesis, hypothesis);
-    let rep_chars: Vec<char> = rep.chars().collect();
-
-    let mut best_confirmed = 0usize;
-    let mut best_checked   = 0usize;
-    let mut best_chars:  Vec<(char, f32)> = Vec::new();
-    let mut best_offset  = 0usize;
-
-    let hyp_len = hypothesis.chars().count();
-
-    for offset in 0..hyp_len {
-        let mut confirmed = 0usize;
-        let mut checked   = 0usize;
-        let mut chars: Vec<(char, f32)> = Vec::new();
-
-        for i in 0..n_pos {
-            let t_idx = offset + i;
-            if t_idx >= rep_chars.len() { break; }
-            let c = rep_chars[t_idx];
-
-            let slot = match char_to_slot(c) {
-                Some(s) => s,
-                None    => continue,  // Character not in our map — skip, don't penalise
-            };
-
-            // Read the probability value for this slot at position i
-            let byte_offset = i * 48 * 4 + slot * 4;
-            if byte_offset + 4 > blob.len() { break; }
-            let energy = f32::from_le_bytes([
-                blob[byte_offset],
-                blob[byte_offset + 1],
-                blob[byte_offset + 2],
-                blob[byte_offset + 3],
-            ]);
-
-            checked += 1;
-
-            // ONLY accept if energy is genuinely above the noise floor
-            if energy >= noise_floor {
-                confirmed += 1;
-                chars.push((c, energy));
-            } else {
-                // Don't immediately stop — the fade profile isn't perfectly
-                // monotonic. A single weak position mid-message shouldn't
-                // discard genuine edge characters either side.
-            }
-        }
-
-        if confirmed > best_confirmed
-            || (confirmed == best_confirmed && checked > best_checked)
-        {
-            best_confirmed = confirmed;
-            best_checked   = checked;
-            best_chars     = chars;
-            best_offset    = offset;
-        }
-    }
-
-    (best_confirmed, best_checked, best_chars, best_offset)
+    let mut acc = AccumulatedProbs::new(n_pos);
+    acc.accumulate(blob);
+    let (nc, nch, chars, _, off) = score_accumulated(&acc, hypothesis, noise_floor);
+    (nc, nch, chars, off)
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
@@ -320,16 +426,17 @@ struct AnalysisRow {
 /// Run the second-pass decoder against a saved capture window.
 ///
 /// Call from `tokio::task::spawn_blocking` at the start of the TX period.
-/// This function opens its own DB connection, scores all pings in the capture
-/// window, deletes the capture from the database when done (self-cleaning),
-/// and returns confirmed recoveries sorted by n_confirmed descending.
 ///
-/// Only pings with >= MIN_CONFIRMED independently-verified characters are returned.
+/// KEY IMPROVEMENT over single-ping scoring:
+/// Pings are grouped by DF bucket (43Hz resolution). Within each bucket,
+/// char_probs are ACCUMULATED (summed) across all pings. This means a
+/// character appearing at probability 0.55 across 8 independent pings
+/// accumulates to 4.4 total energy — well above the effective floor of
+/// 0.51 × 8 = 4.08. Uncorrelated noise averages out across pings.
 ///
-/// # Arguments
-/// * `db_path`     — Path to fsk441.db
-/// * `capture_id`  — ID returned by `store.save_analysis()`
-/// * `ctx`         — Current QSO context (calls, reports, stage, noise floor)
+/// The space constraint validates hypothesis framing: the space character
+/// (slot 15) acts as a sync signal. Its energy distribution across positions
+/// tells us where word boundaries fall, independently of character identity.
 pub fn run(
     db_path:    &str,
     capture_id: i64,
@@ -337,111 +444,176 @@ pub fn run(
 ) -> Result<Vec<SecondPassResult>> {
     let conn = Connection::open(db_path)?;
 
-    // Load all analysis pings for this capture window
-    let mut stmt = conn.prepare(
-        "SELECT detected_at, df_hz, ccf_ratio, mean_confidence,
-                validity_score, COALESCE(raw_decode,''), char_probs
-         FROM analysis_pings
-         WHERE capture_id = ?1
-           AND char_probs IS NOT NULL
-           AND length(char_probs) >= 192  -- at least 1 char × 48 floats × 4 bytes
-         ORDER BY mean_confidence DESC"
-    )?;
+    // During an active QSO, load ALL analysis_pings from this QSO only —
+    // filtered by captured_at >= qso_started_at so previous QSOs in the
+    // same session don't pollute the accumulation.
+    // Outside QSO (Idle), only score the current capture window.
+    let mut stmt = if ctx.qso_active {
+        match &ctx.qso_started_at {
+            Some(started) => conn.prepare(&format!(
+                "SELECT detected_at, df_hz, ccf_ratio, mean_confidence,
+                        validity_score, COALESCE(raw_decode,''), char_probs
+                 FROM analysis_pings
+                 WHERE char_probs IS NOT NULL
+                   AND length(char_probs) >= 192
+                   AND captured_at >= '{}'
+                 ORDER BY mean_confidence DESC",
+                started
+            ))?,
+            None => conn.prepare(
+                "SELECT detected_at, df_hz, ccf_ratio, mean_confidence,
+                        validity_score, COALESCE(raw_decode,''), char_probs
+                 FROM analysis_pings
+                 WHERE char_probs IS NOT NULL
+                   AND length(char_probs) >= 192
+                 ORDER BY mean_confidence DESC"
+            )?,
+        }
+    } else {
+        conn.prepare(
+            "SELECT detected_at, df_hz, ccf_ratio, mean_confidence,
+                    validity_score, COALESCE(raw_decode,''), char_probs
+             FROM analysis_pings
+             WHERE capture_id = ?1
+               AND char_probs IS NOT NULL
+               AND length(char_probs) >= 192
+             ORDER BY mean_confidence DESC"
+        )?
+    };
 
-    let rows: Vec<AnalysisRow> = stmt.query_map([capture_id], |row| {
-        Ok(AnalysisRow {
-            detected_at:     row.get(0)?,
-            df_hz:           row.get::<_, f32>(1).unwrap_or(0.0),
-            ccf_ratio:       row.get::<_, f32>(2).unwrap_or(0.0),
-            mean_confidence: row.get::<_, f32>(3).unwrap_or(0.0),
-            validity_score:  row.get::<_, i32>(4).unwrap_or(0),
-            raw_decode:      row.get(5)?,
-            char_probs:      row.get::<_, Vec<u8>>(6)?,
-        })
-    })?.filter_map(|r| r.ok()).collect();
+    let rows: Vec<AnalysisRow> = if ctx.qso_active {
+        stmt.query_map([], |row| {
+            Ok(AnalysisRow {
+                detected_at:     row.get(0)?,
+                df_hz:           row.get::<_, f32>(1).unwrap_or(0.0),
+                ccf_ratio:       row.get::<_, f32>(2).unwrap_or(0.0),
+                mean_confidence: row.get::<_, f32>(3).unwrap_or(0.0),
+                validity_score:  row.get::<_, i32>(4).unwrap_or(0),
+                raw_decode:      row.get(5)?,
+                char_probs:      row.get::<_, Vec<u8>>(6)?,
+            })
+        })?.filter_map(|r| r.ok()).collect()
+    } else {
+        stmt.query_map([capture_id], |row| {
+            Ok(AnalysisRow {
+                detected_at:     row.get(0)?,
+                df_hz:           row.get::<_, f32>(1).unwrap_or(0.0),
+                ccf_ratio:       row.get::<_, f32>(2).unwrap_or(0.0),
+                mean_confidence: row.get::<_, f32>(3).unwrap_or(0.0),
+                validity_score:  row.get::<_, i32>(4).unwrap_or(0),
+                raw_decode:      row.get(5)?,
+                char_probs:      row.get::<_, Vec<u8>>(6)?,
+            })
+        })?.filter_map(|r| r.ok()).collect()
+    };
 
-    log::info!("[2PASS] capture_id={} loaded {} pings, stage={:?}",
-        capture_id, rows.len(), ctx.stage);
+    log::info!("[2PASS] capture_id={} qso_active={} loaded {} pings, stage={:?}",
+        capture_id, ctx.qso_active, rows.len(), ctx.stage);
 
     if rows.is_empty() {
         return Ok(vec![]);
     }
 
-    // Deduplicate: same (detected_at, ccf_ratio) = same physical ping saved
-    // in multiple overlapping 30s windows. Keep highest mean_confidence copy.
-    let mut seen: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
-    let unique_rows: Vec<&AnalysisRow> = rows.iter().filter(|r| {
-        let key = format!("{:.1}_{:.0}", r.df_hz, r.ccf_ratio);
-        if let Some(&prev_conf) = seen.get(&key) {
-            if r.mean_confidence > prev_conf {
-                seen.insert(key, r.mean_confidence);
-                true
-            } else {
-                false
-            }
-        } else {
-            seen.insert(key, r.mean_confidence);
-            true
-        }
-    }).collect();
+    // ── Group pings by DF bucket (43Hz resolution) ────────────────────────
+    // Pings at the same DF are from the same station/trail. Accumulating
+    // their char_probs reinforces the signal while averaging out noise.
+    let mut df_groups: std::collections::HashMap<i32, Vec<&AnalysisRow>> =
+        std::collections::HashMap::new();
+    for row in &rows {
+        let bucket = (row.df_hz / 43.0).round() as i32;
+        df_groups.entry(bucket).or_default().push(row);
+    }
 
-    log::info!("[2PASS] {} unique pings after deduplication", unique_rows.len());
+    log::info!("[2PASS] {} distinct DF buckets", df_groups.len());
 
-    // Generate hypotheses for current QSO state
     let hypotheses = generate_hypotheses(ctx);
-    log::info!("[2PASS] {} hypotheses: {:?}", hypotheses.len(),
-        hypotheses.iter().take(3).collect::<Vec<_>>());
+    log::info!("[2PASS] {} hypotheses for stage={:?}", hypotheses.len(), ctx.stage);
 
     let mut results: Vec<SecondPassResult> = Vec::new();
 
-    for row in &unique_rows {
-        // Primary decoder already produced a high-quality decode — skip.
-        // Second pass is only for pings the primary decoder couldn't confirm.
-        // validity_score >= 70 means a recognisable callsign was decoded.
-        if row.validity_score >= 70 { continue; }
+    for (bucket, group) in &df_groups {
+        if group.is_empty() { continue; }
 
+        // ── Accumulate char_probs across all pings in this DF bucket ──────
+        let max_chars = group.iter()
+            .map(|r| r.char_probs.len() / (48 * 4))
+            .max()
+            .unwrap_or(0);
+        if max_chars == 0 { continue; }
+
+        let mut acc = AccumulatedProbs::new(max_chars);
+        let mut best_confidence = 0.0f32;
+        let mut best_ccf = 0.0f32;
+        let mut best_detected_at = String::new();
+        let mut best_raw = String::new();
+
+        for row in group {
+            // Skip pings already well-decoded by primary decoder
+            if row.validity_score >= 70 { continue; }
+            acc.accumulate(&row.char_probs);
+            if row.mean_confidence > best_confidence {
+                best_confidence  = row.mean_confidence;
+                best_ccf         = row.ccf_ratio;
+                best_detected_at = row.detected_at.clone();
+                best_raw         = row.raw_decode.clone();
+            }
+        }
+
+        if acc.n_pings == 0 { continue; }
+
+        log::debug!("[2PASS] DF={:+}Hz: {} pings accumulated, max_chars={}",
+            bucket * 43, acc.n_pings, max_chars);
+
+        // ── Score accumulated vector against all hypotheses ───────────────
         let mut best_confirmed = 0usize;
         let mut best_result: Option<SecondPassResult> = None;
 
         for hyp in &hypotheses {
-            let (n_confirmed, n_checked, chars, _offset) =
-                score_blob(&row.char_probs, hyp, ctx.noise_floor);
+            let (n_confirmed, n_checked, chars, space_score, _offset) =
+                score_accumulated(&acc, hyp, ctx.noise_floor);
 
-            if n_confirmed >= MIN_CONFIRMED && n_confirmed > best_confirmed {
+            // Require confirmed characters from received energy AND
+            // reasonable space framing (>0.55 = spaces broadly agree with hypothesis)
+            if n_confirmed >= MIN_CONFIRMED
+                && n_confirmed > best_confirmed
+                && space_score >= 0.55
+            {
                 best_confirmed = n_confirmed;
                 best_result = Some(SecondPassResult {
-                    detected_at:     row.detected_at.clone(),
-                    df_hz:           row.df_hz,
-                    ccf_ratio:       row.ccf_ratio,
-                    mean_confidence: row.mean_confidence,
+                    detected_at:     best_detected_at.clone(),
+                    df_hz:           *bucket as f32 * 43.0,
+                    ccf_ratio:       best_ccf,
+                    mean_confidence: best_confidence,
                     hypothesis:      hyp.trim().to_string(),
                     n_confirmed,
                     n_checked,
                     confirmed_chars: chars,
-                    raw_decode:      row.raw_decode.clone(),
+                    raw_decode:      best_raw.clone(),
                 });
             }
         }
 
         if let Some(r) = best_result {
-            log::info!("[2PASS] Recovered: conf={:.3} ccf={:.1} hyp='{}' n_confirmed={}/{}",
-                r.mean_confidence, r.ccf_ratio, r.hypothesis, r.n_confirmed, r.n_checked);
+            log::info!(
+                "[2PASS] DF={:+.0}Hz n_pings={} hyp='{}' confirmed={}/{} space_ok",
+                r.df_hz, acc.n_pings, r.hypothesis, r.n_confirmed, r.n_checked
+            );
             results.push(r);
         }
     }
 
-    // Sort: most confirmed characters first, then by confidence
     results.sort_by(|a, b| {
         b.n_confirmed.cmp(&a.n_confirmed)
             .then(b.mean_confidence.partial_cmp(&a.mean_confidence).unwrap())
     });
 
-    log::info!("[2PASS] Complete: {} recoveries from {} unique pings",
-        results.len(), unique_rows.len());
+    log::info!("[2PASS] Complete: {} recoveries from {} DF buckets ({} total pings)",
+        results.len(), df_groups.len(), rows.len());
 
-    // Delete the capture from DB unless the operator has enabled Save Max Data,
-    // in which case analysis_pings is retained for off-line analysis.
-    if !ctx.retain_after_run {
+    // During an active QSO: retain analysis_pings so next period can accumulate.
+    // At QSO end (qso_active=false): delete only this capture window.
+    // The app-level Clear handler deletes all pings from the QSO period.
+    if !ctx.qso_active && !ctx.retain_after_run {
         let deleted = conn.execute(
             "DELETE FROM analysis_pings WHERE capture_id = ?1",
             [capture_id],
@@ -450,8 +622,10 @@ pub fn run(
             Ok(n) => log::info!("[2PASS] Deleted capture_id={} ({} rows)", capture_id, n),
             Err(e) => log::warn!("[2PASS] Failed to delete capture_id={}: {}", capture_id, e),
         }
+    } else if ctx.qso_active {
+        log::info!("[2PASS] QSO active — retaining analysis_pings for cross-period accumulation");
     } else {
-        log::info!("[2PASS] Save Max Data enabled — retaining capture_id={}", capture_id);
+        log::info!("[2PASS] Save Max Data — retaining capture_id={}", capture_id);
     }
 
     Ok(results)
@@ -491,13 +665,16 @@ mod tests {
     #[test]
     fn hypotheses_idle_with_call() {
         let ctx = QsoContext {
-            my_call:     "GW4WND".into(),
-            their_call:  Some("SM4SJY".into()),
-            their_loc:   Some("IO82".into()),
-            report_sent: None,
-            report_rcvd: None,
-            stage:       QsoStage::Idle,
-            noise_floor: 0.557,
+            my_call:        "GW4WND".into(),
+            their_call:     Some("SM4SJY".into()),
+            their_loc:      Some("IO82".into()),
+            report_sent:    None,
+            report_rcvd:    None,
+            stage:          QsoStage::Idle,
+            noise_floor:    0.557,
+            retain_after_run: false,
+            qso_active:     false,
+            qso_started_at: None,
         };
         let h = generate_hypotheses(&ctx);
         assert!(!h.is_empty());
@@ -511,13 +688,16 @@ mod tests {
     #[test]
     fn hypotheses_sent_report_specific() {
         let ctx = QsoContext {
-            my_call:     "GW4WND".into(),
-            their_call:  Some("SM4SJY".into()),
-            their_loc:   None,
-            report_sent: Some("26".into()),
-            report_rcvd: None,
-            stage:       QsoStage::SentReport,
-            noise_floor: 0.557,
+            my_call:        "GW4WND".into(),
+            their_call:     Some("SM4SJY".into()),
+            their_loc:      None,
+            report_sent:    Some("26".into()),
+            report_rcvd:    None,
+            stage:          QsoStage::SentReport,
+            noise_floor:    0.557,
+            retain_after_run: false,
+            qso_active:     false,
+            qso_started_at: None,
         };
         let h = generate_hypotheses(&ctx);
         // R26 must appear — it's in REPORTS, covered regardless of what report_sent is
@@ -536,32 +716,67 @@ mod tests {
 
     #[test]
     fn score_blob_all_zeros_gives_zero_confirmed() {
-        // A zero blob should never confirm anything
         let blob = vec![0u8; 22 * 48 * 4];
         let (n, _, _, _) = score_blob(&blob, "CQ SM4SJY IO82", 0.55);
         assert_eq!(n, 0, "Zero blob should confirm nothing");
     }
 
     #[test]
-    fn score_blob_synthetic_signal() {
-        // Build a synthetic blob with known energy above noise floor
-        // for the message "SM4SJY" at positions 0-5
-        let n_chars = 6;
+    fn accumulated_probs_sums_correctly() {
+        let mut acc = AccumulatedProbs::new(4);
+        let mut blob = vec![0u8; 4 * 48 * 4];
+        let e: f32 = 0.6;
+        blob[0..4].copy_from_slice(&e.to_le_bytes());
+        acc.accumulate(&blob);
+        acc.accumulate(&blob);
+        assert_eq!(acc.n_pings, 2);
+        let total = acc.get(0, 0);
+        assert!((total - 1.2).abs() < 1e-5, "Expected 1.2, got {}", total);
+    }
+
+    #[test]
+    fn accumulation_confirms_weak_signal() {
+        // Signal per ping at 0.53 — just above floor 0.51
+        // After 5 pings: accumulated = 2.65 > effective_floor 0.51×5 = 2.55
+        let floor = 0.51f32;
+        let signal = 0.53f32;
+        let message = "GW4WND";
+        let n_chars = message.len();
+        let noise: f32 = (1.0 - signal) / 47.0;
         let mut blob = vec![0u8; n_chars * 48 * 4];
-        let message = "SM4SJY";
         for (i, c) in message.chars().enumerate() {
-            if let Some(slot) = char_to_slot(c) {
-                let offset = i * 48 * 4 + slot * 4;
-                let energy: f32 = 0.80;
-                blob[offset..offset+4].copy_from_slice(&energy.to_le_bytes());
+            let slot = char_to_slot(c).unwrap();
+            for s in 0..48 {
+                let v: f32 = if s == slot { signal } else { noise };
+                let off = i * 48 * 4 + s * 4;
+                blob[off..off+4].copy_from_slice(&v.to_le_bytes());
             }
         }
-        // Score against a hypothesis containing SM4SJY
-        let (n, checked, chars, _) = score_blob(&blob, "CQ SM4SJY IO82", 0.55);
-        assert!(n >= 4, "Expected ≥4 confirmed, got {}", n);
-        assert!(checked > 0);
-        for (c, e) in &chars {
-            assert!(*e >= 0.55, "Energy {:.3} below floor for char '{}'", e, c);
+        let mut acc = AccumulatedProbs::new(n_chars);
+        for _ in 0..5 { acc.accumulate(&blob); }
+        let (n, _, _, _, _) = score_accumulated(&acc, message, floor);
+        assert_eq!(n, n_chars, "Accumulated should confirm all {} chars", n_chars);
+    }
+
+    #[test]
+    fn space_constraint_validates_framing() {
+        let message = "SM4SJY GW4WND";
+        let n_chars = message.len();
+        let mut blob = vec![0u8; n_chars * 48 * 4];
+        let noise: f32 = 0.01;
+        let signal: f32 = 0.70;
+        for (i, c) in message.chars().enumerate() {
+            let slot = char_to_slot(c).unwrap();
+            for s in 0..48 {
+                let off = i * 48 * 4 + s * 4;
+                let v = if s == slot { signal } else { noise };
+                blob[off..off+4].copy_from_slice(&v.to_le_bytes());
+            }
         }
+        let mut acc = AccumulatedProbs::new(n_chars);
+        acc.accumulate(&blob);
+        let (_, _, _, space_score, _) = score_accumulated(&acc, message, 0.51);
+        assert!(space_score > 0.5,
+            "Space framing should score >0.5 for correct hypothesis, got {}", space_score);
     }
 }

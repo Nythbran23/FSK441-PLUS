@@ -211,6 +211,15 @@ pub struct DecodeEntry {
     second_pass_chars: Vec<(char, bool)>,
 }
 
+/// Source/confidence of a soft-decoded character in the QSO progress strip.
+#[derive(Clone, PartialEq)]
+enum SoftSource {
+    /// Seen in a primary real-time decode above the display gate.
+    Hard,
+    /// Confirmed by second-pass accumulation above noise floor but not primary.
+    Soft,
+}
+
 enum EngineEvent { Decode(DecodeEntry), Accumulated(AccumulatedDecode), Hamlib(HamlibUpdate), Spectrum(Vec<f32>, f32), AnalysisSaved(i64, usize), SecondPassDecodes(Vec<second_pass::SecondPassResult>), NoiseStats { mean: f32, sigma: f32, p99: f32, threshold: f32 }, ConfUpdate(f32, bool) }
 
 
@@ -476,6 +485,14 @@ struct Fsk441App {
     their_loc_edit:  String,
     report_sent:     String,
     report_rcvd:     String,
+    // Soft-decode progress: character-by-character evidence from accumulator.
+    // Each entry is (char, source) where source indicates confidence level.
+    // Hard = seen in a real-time primary decode above threshold.
+    // Soft = confirmed by second-pass accumulation above noise floor.
+    // These fill in progressively during a QSO.
+    soft_their_call: Vec<(char, SoftSource)>,
+    soft_report_rcvd: Vec<(char, SoftSource)>,
+    soft_my_call: Vec<(char, SoftSource)>,
     // Editable TX message fields — shown in UI, user can override defaults
     tx_msgs:         [String; 6],  // [CQ, TX1, TX2, TX3, TX4, TX5]
     tx_active:       std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -628,6 +645,7 @@ impl Fsk441App {
             qso: QsoState::Idle,
             their_call_edit: String::new(), their_loc_edit: String::new(),
             report_sent: "26".into(), report_rcvd: String::new(),
+            soft_their_call: Vec::new(), soft_report_rcvd: Vec::new(), soft_my_call: Vec::new(),
             tx_active: tx_active_for_app,
         show_accumulated: true,
         active_tx_idx: None,
@@ -748,6 +766,63 @@ impl Fsk441App {
                         is_second_pass: false,
                         second_pass_chars: vec![],
                     };
+
+                    // ── Soft-decode progress update from accumulator ────────
+                    // The accumulator text is the best available reconstruction
+                    // of what was actually received. Parse it for our call,
+                    // their call, and report — updating the progress strip.
+                    // Accumulator = Soft source (not a hard single-ping decode).
+                    if self.settings.their_call_hint.is_some() {
+                        let my    = self.settings.my_call.trim().to_uppercase();
+                        let their = self.their_call_edit.trim().to_uppercase();
+                        for token in acc.text.split_whitespace() {
+                            let tu = token.to_uppercase();
+                            let digits: String = tu.trim_start_matches('R')
+                                .chars().filter(|c| c.is_ascii_digit()).collect();
+
+                            // Only match if token plausibly overlaps with known callsign
+                            let matches_my = tu == my
+                                || my.starts_with(&tu)
+                                || (tu.len() >= 3 && my.contains(&tu))
+                                || (tu.len() >= 3 && tu.contains(&my));
+                            let matches_their = !their.is_empty() && (
+                                tu == their
+                                || their.starts_with(&tu)
+                                || (tu.len() >= 3 && their.contains(&tu))
+                                || (tu.len() >= 3 && tu.contains(&their)));
+
+                            if matches_my {
+                                let chars: Vec<(char, SoftSource)> = my.chars()
+                                    .map(|c| (c, SoftSource::Soft)).collect();
+                                let current_has_hard = self.soft_my_call.iter()
+                                    .any(|(_, s)| *s == SoftSource::Hard);
+                                if !current_has_hard && chars.len() >= self.soft_my_call.len() {
+                                    self.soft_my_call = chars;
+                                }
+                            } else if matches_their {
+                                let chars: Vec<(char, SoftSource)> = their.chars()
+                                    .map(|c| (c, SoftSource::Soft)).collect();
+                                let current_has_hard = self.soft_their_call.iter()
+                                    .any(|(_, s)| *s == SoftSource::Hard);
+                                if !current_has_hard && chars.len() >= self.soft_their_call.len() {
+                                    self.soft_their_call = chars;
+                                }
+                            } else if digits.len() == 2 {
+                                let d: Vec<u32> = digits.chars()
+                                    .filter_map(|c| c.to_digit(10)).collect();
+                                if d.len() == 2 && d[0] < d[1] && d[0] >= 1 && d[1] >= 6 {
+                                    let current_has_hard = self.soft_report_rcvd.iter()
+                                        .any(|(_, s)| *s == SoftSource::Hard);
+                                    if !current_has_hard {
+                                        self.soft_report_rcvd = digits.chars()
+                                            .map(|c| (c, SoftSource::Soft)).collect();
+                                    }
+                                }
+                            }
+                            // Unrecognised token — ignore, don't pollute strip
+                        }
+                    }
+
                     // Update seen callsigns — exclude MYCALL
                     let my = self.settings.my_call.to_uppercase();
                     for call in &entry.callsigns {
@@ -826,6 +901,10 @@ impl Fsk441App {
                         report_sent, report_rcvd, stage,
                         noise_floor: self.adaptive_threshold,
                         retain_after_run: self.settings.save_max_data,
+                        // Active QSO = accumulate across periods; don't delete between them
+                        qso_active: self.settings.their_call_hint.is_some(),
+                        // Filter to only this QSO's pings
+                        qso_started_at: self.qso_time_on.map(|t| t.to_rfc3339()),
                     };
                     let et = self.event_tx.clone();
                     let db = self.second_pass_db_path.clone();
@@ -844,9 +923,6 @@ impl Fsk441App {
                 }
                 EngineEvent::SecondPassDecodes(results) => {
                     log::info!("[UI] Second-pass: {} recoveries", results.len());
-                    // Deduplicate by hypothesis — keep only the best (highest n_confirmed)
-                    // result per unique hypothesis string. Multiple pings may confirm the
-                    // same message; showing each one floods the display with identical rows.
                     let mut best_by_hyp: std::collections::HashMap<String, second_pass::SecondPassResult> =
                         std::collections::HashMap::new();
                     for r in results {
@@ -857,11 +933,39 @@ impl Fsk441App {
                             *entry = r;
                         }
                     }
-                    // Sort for stable insertion order: most confirmed first
                     let mut deduped: Vec<second_pass::SecondPassResult> =
                         best_by_hyp.into_values().collect();
                     deduped.sort_by(|a, b| b.n_confirmed.cmp(&a.n_confirmed)
                         .then(b.mean_confidence.partial_cmp(&a.mean_confidence).unwrap()));
+
+                    // ── Soft-decode progress update (soft source) ─────────────
+                    // Only update report from second-pass — we cannot safely show
+                    // callsign characters from hypothesis text without knowing
+                    // which exact positions had confirmed energy (score_accumulated
+                    // returns confirmed_chars without position indices). Report is
+                    // only 2 digits so the ambiguity is manageable.
+                    if self.settings.their_call_hint.is_some() {
+                        if let Some(best) = deduped.first() {
+                            // Extract report from hypothesis: 2 digits where first < second
+                            for token in best.hypothesis.split_whitespace() {
+                                let tu: String = token.trim_start_matches('R').to_uppercase();
+                                if tu.len() == 2 && tu.chars().all(|c| c.is_ascii_digit()) {
+                                    let d: Vec<u32> = tu.chars()
+                                        .filter_map(|c| c.to_digit(10)).collect();
+                                    if d.len() == 2 && d[0] < d[1] {
+                                        // Only update if not already hard-confirmed
+                                        let already_hard = self.soft_report_rcvd.iter()
+                                            .any(|(_, s)| *s == SoftSource::Hard);
+                                        if !already_hard {
+                                            self.soft_report_rcvd = tu.chars()
+                                                .map(|c| (c, SoftSource::Soft)).collect();
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     for r in deduped {
                         let ts = chrono::DateTime::parse_from_rfc3339(&r.detected_at)
@@ -1013,6 +1117,61 @@ impl Fsk441App {
             // Update station tracker
             if self.settings.station_tracker_enabled {
                 self.station_tracker.add_ping(&entry);
+            }
+
+            // ── Soft-decode progress update (hard source) ─────────────────
+            // Real-time primary decodes update the progress strip.
+            // Hard always wins over Soft — a decoded fragment overrides
+            // anything from accumulation, regardless of length.
+            // Only update if the token plausibly matches the known callsign —
+            // don't treat every unrecognised fragment as "their call".
+            if self.settings.their_call_hint.is_some() {
+                let my  = self.settings.my_call.trim().to_uppercase();
+                let their = self.their_call_edit.trim().to_uppercase();
+                for call in &entry.callsigns {
+                    let call_up = call.to_uppercase();
+                    // Match my call: fragment must be a prefix of or equal to my call
+                    let matches_my = call_up == my
+                        || my.starts_with(&call_up)
+                        || (call_up.len() >= 3 && my.contains(&call_up));
+                    // Match their call: fragment must be a prefix of or equal to their call
+                    let matches_their = !their.is_empty() && (
+                        call_up == their
+                        || their.starts_with(&call_up)
+                        || (call_up.len() >= 3 && their.contains(&call_up)));
+
+                    if matches_my {
+                        let chars: Vec<(char, SoftSource)> = my.chars()
+                            .map(|c| (c, SoftSource::Hard)).collect();
+                        let current_has_hard = self.soft_my_call.iter()
+                            .any(|(_, s)| *s == SoftSource::Hard);
+                        if !current_has_hard || chars.len() > self.soft_my_call.len() {
+                            self.soft_my_call = chars;
+                        }
+                    } else if matches_their {
+                        let chars: Vec<(char, SoftSource)> = their.chars()
+                            .map(|c| (c, SoftSource::Hard)).collect();
+                        let current_has_hard = self.soft_their_call.iter()
+                            .any(|(_, s)| *s == SoftSource::Hard);
+                        if !current_has_hard || chars.len() > self.soft_their_call.len() {
+                            self.soft_their_call = chars;
+                        }
+                    }
+                    // Unrecognised fragment — ignore, don't pollute the strip
+                }
+                if let Some(ref rpt) = entry.report {
+                    let clean: String = rpt.trim_start_matches('R')
+                        .trim_start_matches('r').to_string();
+                    if clean.len() >= 2 {
+                        let chars: Vec<(char, SoftSource)> = clean.chars()
+                            .take(2).map(|c| (c, SoftSource::Hard)).collect();
+                        let current_has_hard = self.soft_report_rcvd.iter()
+                            .any(|(_, s)| *s == SoftSource::Hard);
+                        if !current_has_hard {
+                            self.soft_report_rcvd = chars;
+                        }
+                    }
+                }
             }
             self.decodes.push(entry.clone());
             if self.decodes.len() > 500 { self.decodes.remove(0); }
@@ -1604,6 +1763,66 @@ impl eframe::App for Fsk441App {
                             }
                         }
                     }
+
+                    // ── Soft-decode progress strip ──────────────────────────
+                    // Shows character-by-character evidence for what has been
+                    // received. A valid QSO requires: their call + our call + report.
+                    // White  = Hard: seen in a real-time primary decode.
+                    // Cyan   = Soft: confirmed by accumulation above noise floor.
+                    // ·      = not yet received at this position.
+                    if self.settings.their_call_hint.is_some() {
+                        let their_call = self.their_call_edit.trim().to_uppercase();
+                        let my_call    = self.settings.my_call.trim().to_uppercase();
+                        let show = !self.soft_their_call.is_empty()
+                            || !self.soft_my_call.is_empty()
+                            || !self.soft_report_rcvd.is_empty();
+                        if show {
+                            ui.separator();
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new("Rcvd")
+                                    .color(egui::Color32::from_gray(160)).small());
+
+                                // Helper closure: render one row of char progress
+                                let render_chars = |ui: &mut egui::Ui,
+                                    chars: &Vec<(char, SoftSource)>,
+                                    expected_len: usize|
+                                {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 1.0;
+                                        for i in 0..expected_len {
+                                            let (ch, col) = match chars.get(i) {
+                                                // Hard = primary real-time decode — full white
+                                                Some((c, SoftSource::Hard)) =>
+                                                    (*c, egui::Color32::from_rgb(240, 240, 240)),
+                                                // Soft = accumulator/second-pass — cyan
+                                                Some((c, SoftSource::Soft)) =>
+                                                    (*c, egui::Color32::from_rgb(80, 200, 220)),
+                                                // Not yet received — dim dot
+                                                None => ('·', egui::Color32::from_gray(70)),
+                                            };
+                                            ui.label(egui::RichText::new(ch.to_string())
+                                                .monospace().color(col));
+                                        }
+                                    });
+                                };
+
+                                // Their call — use their_call_edit length as the target
+                                // (we know the full callsign from QSO context)
+                                let their_len = their_call.len()
+                                    .max(self.soft_their_call.len());
+                                render_chars(ui, &self.soft_their_call, their_len);
+
+                                // My call — use my_call setting length
+                                let my_len = my_call.len()
+                                    .max(self.soft_my_call.len());
+                                render_chars(ui, &self.soft_my_call, my_len);
+
+                                // Report — always 2 digits
+                                render_chars(ui, &self.soft_report_rcvd, 2);
+                            });
+                        }
+                    }
+
                     // LOG QSO — right-justified, appears when report received
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let can_log = !self.their_call_edit.trim().is_empty()
@@ -1827,6 +2046,30 @@ impl eframe::App for Fsk441App {
                         let _ = self.settings_watch_tx.send(self.settings.clone());
                         self.settings.clear_accumulator = false;
                         self.qso_log.push("--- Cleared ---".to_string());
+                        // Clear soft-decode progress for next QSO
+                        self.soft_their_call.clear();
+                        self.soft_report_rcvd.clear();
+                        self.soft_my_call.clear();
+                        // Delete accumulated analysis_pings from the now-ended QSO only
+                        let db = self.second_pass_db_path.clone();
+                        let qso_start = self.qso_time_on.map(|t| t.to_rfc3339());
+                        self._runtime.spawn(async move {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                if let Ok(conn) = rusqlite::Connection::open(&db) {
+                                    let result = match qso_start {
+                                        Some(ts) => conn.execute(
+                                            "DELETE FROM analysis_pings WHERE captured_at >= ?1",
+                                            rusqlite::params![ts],
+                                        ),
+                                        None => conn.execute("DELETE FROM analysis_pings", []),
+                                    };
+                                    match result {
+                                        Ok(n) => log::info!("[2PASS] QSO cleared — deleted {} analysis_pings", n),
+                                        Err(e) => log::warn!("[2PASS] Clear delete failed: {}", e),
+                                    }
+                                }
+                            }).await;
+                        });
                     }
 
                     // NF, conf and k slider — right justified in this row
@@ -2238,13 +2481,19 @@ impl eframe::App for Fsk441App {
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for i in 0..self.decodes.len() {
-                        let e   = &self.decodes[i];
-                        if e.is_accumulated { continue; } // shown in QSO panel
-                        let sel = self.selected == Some(i);
-                        let _e_passed = e.passed_threshold;
-                        let _e_accum  = e.is_accumulated;
+                .show_rows(
+                    ui,
+                    ui.text_style_height(&egui::TextStyle::Monospace) + 2.0,
+                    self.decodes.iter().filter(|e| !e.is_accumulated).count(),
+                    |ui, row_range| {
+                    // Build display-only index (skip accumulated entries)
+                    let display_indices: Vec<usize> = (0..self.decodes.len())
+                        .filter(|&i| !self.decodes[i].is_accumulated)
+                        .collect();
+                    for i in row_range {
+                        let Some(&di) = display_indices.get(i) else { continue; };
+                        let e   = &self.decodes[di];
+                        let sel = self.selected == Some(di);
 
                         // Dur/S: duration ms / MSHV-style strength 1-9
                         // MSHV maps CCF to 1-9 on a doubling scale from threshold
@@ -2420,11 +2669,11 @@ impl eframe::App for Fsk441App {
                         // Deselection works regardless of QSO state.
                         // Auto-population of their call only happens when not locked.
                         if resp.clicked() || resp.secondary_clicked() {
-                            if self.selected == Some(i) {
+                            if self.selected == Some(di) {
                                 self.selected = None;
                                 continue;
                             }
-                            self.selected = Some(i);
+                            self.selected = Some(di);
                             // Only auto-populate call/loc/report when not locked
                             if !in_qso {
                                 let my = self.settings.my_call.to_uppercase();
@@ -2497,7 +2746,7 @@ impl eframe::App for Fsk441App {
                             );
                         }
                     }
-                });
+                }); // end show_rows
         });
 
         // ── Settings window (matches MSK2K layout) ────────────────────────
@@ -3038,10 +3287,36 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
         let now_ms    = chrono::Utc::now().timestamp_millis();
         let slot_idx  = now_ms / 30_000;
         if slot_idx != current_slot_idx && current_slot_idx >= 0 {
+            // ── In-QSO slot flush: save ring and re-run second-pass ───────────
+            // During an active QSO, re-analyse all accumulated energy at every
+            // slot boundary (every 30s) even during RX. As more pings accumulate
+            // in the DB across periods, the scorer sees more evidence and may
+            // push weak signals above threshold that didn't reach it before.
+            // This is distinct from the RX→TX trigger — it fires mid-RX.
+            // The ring is saved but not deleted from DB (qso_active=true).
+            if settings.their_call_hint.is_some() && !is_tx {
+                if let Some(ref s) = store {
+                    let entries: Vec<AnalysisPing> = analysis_ring.iter().cloned().collect();
+                    if !entries.is_empty() {
+                        match s.save_analysis(&entries) {
+                            Ok(cid) => {
+                                let _ = event_tx.send(EngineEvent::AnalysisSaved(cid, entries.len()));
+                                log::info!("[2PASS] QSO slot flush: {} pings saved, re-analysing", entries.len());
+                                analysis_ring.clear();
+                            }
+                            Err(e) => log::error!("[DB] QSO slot flush failed: {}", e),
+                        }
+                    } else {
+                        // Ring empty but we still want to re-score accumulated DB pings
+                        let _ = event_tx.send(EngineEvent::AnalysisSaved(0, 0));
+                    }
+                }
+            }
+
             // ── Flush analysis ring to DB when Max Data is on ─────────────────
-            // Saves soft-bit char_probs for every ping captured this slot,
-            // regardless of QSO state — for post-session offline analysis.
-            if settings.save_max_data {
+            // Saves soft-bit char_probs for every ping captured this slot.
+            // Skip if already flushed by the QSO slot path above (ring empty).
+            if settings.save_max_data && !settings.their_call_hint.is_some() {
                 if let Some(ref s) = store {
                     let entries: Vec<AnalysisPing> = analysis_ring.iter().cloned().collect();
                     if !entries.is_empty() {
@@ -3158,6 +3433,13 @@ async fn run_engine(settings: Settings, event_tx: mpsc::UnboundedSender<EngineEv
         let should_store = settings.save_max_data || conf >= adaptive_conf_threshold;
         if should_store {
             if let Some(ref s) = store { let _ = s.insert_ping(session_id, &ping, &result, &parsed); }
+        }
+
+        // Periodically prune stale df_display_tracker entries — prevents
+        // unbounded growth during long sessions and ensures deduplication
+        // doesn't pass stale DF entries from hours ago.
+        if ema_ping_count % 500 == 0 {
+            df_display_tracker.retain(|_, (t, _)| t.elapsed().as_secs() < 60);
         }
 
         // ── Single adaptive conf gate ────────────────────────────────────────

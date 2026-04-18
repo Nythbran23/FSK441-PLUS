@@ -51,22 +51,39 @@ pub fn encode_message(msg: &str) -> Vec<u8> {
     t
 }
 
-/// Generate FSK441 audio natively at `device_rate` Hz.
-/// Like MSHV, we scale NSPD by `device_rate/11025` so tones are mathematically
-/// correct at the device's actual sample rate — no resampling needed or used.
+/// Generate FSK441 audio at `device_rate` Hz with exact 441 Hz baud rate.
+///
+/// At 48000 Hz, 441 baud requires 108.843... samples per dit — not an integer.
+/// Rounding to 109 gives 440.37 Hz baud (0.14% error). This is harmless for
+/// informal use but MSHV's chk441 cross-correlates against an exact 441 Hz
+/// reference; the phase drift over a message (~2 samples at 60 dits) reduces
+/// the correlation score below the auto-decode threshold (0.75) while still
+/// passing manual decode (0.60).
+///
+/// Fix: fractional sample accumulation. Each dit gets floor(carry) or
+/// ceil(carry) samples so the average baud rate is exactly 441 Hz regardless
+/// of device rate. The tones themselves are always at exact FSK441 frequencies
+/// (882, 1323, 1764, 2205 Hz) via continuous phase accumulation.
 pub fn gen441_at_rate(tones: &[u8], device_rate: u32) -> Vec<f32> {
-    // Ratio of device rate to base FSK441 rate (11025 Hz)
-    let koef = device_rate as f64 / SAMPLE_RATE as f64;
-    // Samples per dit at device rate — must be integer for clean tone boundaries
-    let nspd = (NSPD as f64 * koef).round() as usize;
     let dt = 1.0_f64 / device_rate as f64;
+    // Exact dit duration at 441 baud
+    let samples_per_dit = device_rate as f64 / 441.0_f64;
     const BASE_AMPLITUDE: f32 = 0.612;
-    let mut s = Vec::with_capacity(tones.len() * nspd);
-    let mut phi = 0.0_f64;
+    let mut s = Vec::with_capacity((tones.len() as f64 * samples_per_dit) as usize + 2);
+    let mut phi   = 0.0_f64;
+    let mut carry = 0.0_f64;  // accumulated fractional samples
+
     for &ti in tones {
         let freq = tone_freq(ti as usize) as f64;
         let dpha = std::f64::consts::TAU * freq * dt;
-        for _ in 0..nspd {
+
+        // Accumulate and take the integer part — alternates between floor and
+        // ceiling to keep average exactly at 441 baud
+        carry += samples_per_dit;
+        let n = carry as usize;   // floor
+        carry -= n as f64;        // keep fractional remainder for next dit
+
+        for _ in 0..n {
             phi += dpha;
             s.push((phi.sin() as f32) * BASE_AMPLITUDE);
         }
@@ -134,6 +151,59 @@ pub fn find_input_device(display_name: &str) -> Option<cpal::Device> {
 /// Query the actual output sample rate of the named device.
 /// Prefers 44100Hz (exact 4× multiple of 11025Hz FSK441 base rate, zero baud error).
 /// Falls back to device default, then OUTPUT_SAMPLE_RATE.
+/// Log all supported sample rates and formats for a named device.
+/// Called at startup so the log shows exactly what the codec supports.
+pub fn probe_device(display_name: &str) {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let host = cpal::default_host();
+    log::info!("[PROBE] Probing audio device: '{}'", display_name);
+    let (base, _) = parse_device_suffix(display_name);
+    let mut found = false;
+    if let Ok(devs) = host.devices() {
+        for d in devs {
+            let name = d.name().unwrap_or_default();
+            if !name.contains(&base) && !base.contains(&name) { continue; }
+            found = true;
+            log::info!("[PROBE] Device: '{}'", name);
+            if let Ok(cfgs) = d.supported_output_configs() {
+                let cfgs: Vec<_> = cfgs.collect();
+                if cfgs.is_empty() {
+                    log::info!("[PROBE]   OUTPUT: none");
+                }
+                for c in &cfgs {
+                    log::info!("[PROBE]   OUTPUT ch={} rate={}-{} fmt={:?} buf={:?}",
+                        c.channels(), c.min_sample_rate().0,
+                        c.max_sample_rate().0, c.sample_format(),
+                        c.buffer_size());
+                }
+            }
+            if let Ok(cfgs) = d.supported_input_configs() {
+                let cfgs: Vec<_> = cfgs.collect();
+                if cfgs.is_empty() {
+                    log::info!("[PROBE]   INPUT: none");
+                }
+                for c in &cfgs {
+                    log::info!("[PROBE]   INPUT  ch={} rate={}-{} fmt={:?} buf={:?}",
+                        c.channels(), c.min_sample_rate().0,
+                        c.max_sample_rate().0, c.sample_format(),
+                        c.buffer_size());
+                }
+            }
+            if let Ok(c) = d.default_output_config() {
+                log::info!("[PROBE]   Default OUT: ch={} rate={} fmt={:?}",
+                    c.channels(), c.sample_rate().0, c.sample_format());
+            }
+            if let Ok(c) = d.default_input_config() {
+                log::info!("[PROBE]   Default IN:  ch={} rate={} fmt={:?}",
+                    c.channels(), c.sample_rate().0, c.sample_format());
+            }
+        }
+    }
+    if !found {
+        log::warn!("[PROBE] Device '{}' not found", display_name);
+    }
+}
+
 fn get_device_rate(device_name: Option<&str>) -> u32 {
     use cpal::traits::{DeviceTrait, HostTrait};
     let device = if let Some(name) = device_name {
@@ -141,24 +211,48 @@ fn get_device_rate(device_name: Option<&str>) -> u32 {
     } else {
         cpal::default_host().default_output_device()
     };
-    if let Some(d) = device {
-        // Check if 44100Hz is supported — perfect integer multiple of 11025Hz
-        if let Ok(configs) = d.supported_output_configs() {
-            for cfg in configs {
-                if cfg.min_sample_rate().0 <= 44100 && cfg.max_sample_rate().0 >= 44100 {
-                    log::info!("[TX] Device supports 44100Hz — using for zero baud error");
-                    return 44100;
-                }
+
+    let device = match device {
+        Some(d) => d,
+        None => {
+            log::warn!("[TX] get_device_rate: no device — defaulting to {}", OUTPUT_SAMPLE_RATE);
+            return OUTPUT_SAMPLE_RATE;
+        }
+    };
+
+    // Preferred rates in order — first one that successfully opens a stream wins.
+    // We do NOT rely on supported_output_configs() — it returns empty on macOS
+    // CoreAudio and is unreliable on Windows WASAPI for USB audio devices.
+    // CoreAudio and WASAPI both resample transparently to hardware rate, so
+    // requesting 11025 or 44100 Hz works even if the hardware runs at 48000 Hz.
+    let candidates: &[u32] = &[11025, 44100, 48000, 22050, 32000];
+
+    for &rate in candidates {
+        let config = cpal::StreamConfig {
+            channels:    1,
+            sample_rate: cpal::SampleRate(rate),
+            buffer_size: cpal::BufferSize::Default,
+        };
+        let test = device.build_output_stream(
+            &config,
+            |out: &mut [f32], _| { out.fill(0.0); },
+            |_| {},
+            None,
+        );
+        match test {
+            Ok(_stream) => {
+                drop(_stream);
+                log::info!("[TX] Device rate probe: {}Hz accepted ✓ (zero baud error: {})",
+                    rate, rate == 11025 || rate == 44100);
+                return rate;
+            }
+            Err(e) => {
+                log::debug!("[TX] Device rate probe: {}Hz rejected ({})", rate, e);
             }
         }
-        // Fall back to device default
-        if let Ok(cfg) = d.default_output_config() {
-            let rate = cfg.sample_rate().0;
-            log::info!("[TX] Device actual sample rate: {}Hz", rate);
-            return rate;
-        }
     }
-    log::warn!("[TX] Could not query device rate — using {}", OUTPUT_SAMPLE_RATE);
+
+    log::warn!("[TX] All rate probes failed — defaulting to {}", OUTPUT_SAMPLE_RATE);
     OUTPUT_SAMPLE_RATE
 }
 
@@ -785,6 +879,10 @@ impl TxEngine {
         hamlib_update_tx: mpsc::UnboundedSender<HamlibUpdate>,
         tx_active:        std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
+        // Probe device capabilities at startup — logs all supported rates/formats
+        if let Some(ref name) = output_device {
+            probe_device(name);
+        }
         // Query device rate once at startup — used for all waveform generation
         let device_rate = get_device_rate(output_device.as_deref());
         log::info!("[TX] Output device rate: {}Hz (koef={:.3}x)",
@@ -865,6 +963,9 @@ impl TxEngine {
                     TxCommand::SetOutputDevice(dev) => {
                         log::info!("[TX] Output device changed to {:?}", dev);
                         self.output_device = dev;
+                        if let Some(ref name) = self.output_device {
+                            probe_device(name);
+                        }
                         // Re-query device rate for new device
                         self.device_rate = get_device_rate(self.output_device.as_deref());
                         log::info!("[TX] New device rate: {}Hz", self.device_rate);
