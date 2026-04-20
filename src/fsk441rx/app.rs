@@ -25,6 +25,7 @@ mod accumulator;
 mod adif;
 mod scatter;
 mod second_pass;
+mod logging;
 
 use detector::run_detector;
 use demod::longx;
@@ -277,6 +278,12 @@ struct Settings {
     qsy_reset:      bool,  // pulse: reset EMA on QSY
     ptt_method:     PttMethod,
     ptt_serial_port: String,
+    // ── Logging ──────────────────────────────────────────────────────────────
+    adif_log_enabled: bool,
+    adif_log_path:  String,
+    udp_log_enabled: bool,
+    udp_log_host:   String,
+    udp_log_port:   u16,
 }
 
 impl Default for Settings {
@@ -307,6 +314,11 @@ impl Default for Settings {
             qsy_reset:      false,
             ptt_method:     PttMethod::HamlibCat,
             ptt_serial_port: String::new(),
+            adif_log_enabled: true,
+            adif_log_path:  default_adif_path(),
+            udp_log_enabled: false,
+            udp_log_host:   "127.0.0.1".into(),
+            udp_log_port:   2237,
         }
     }
 }
@@ -653,7 +665,7 @@ impl Fsk441App {
         df_dots: Vec::new(),
         qso_time_on: None,
         qso_logged: false,
-        adif_logger: AdifLogger::new(&AdifLogger::default_path()),
+        adif_logger: AdifLogger::new(std::path::Path::new(&settings.adif_log_path)),
         adif_log: Vec::new(),
         noise_mean: 0.44,
         noise_sigma: 0.02,
@@ -901,10 +913,9 @@ impl Fsk441App {
                         report_sent, report_rcvd, stage,
                         noise_floor: self.adaptive_threshold,
                         retain_after_run: self.settings.save_max_data,
-                        // Active QSO = accumulate across periods; don't delete between them
                         qso_active: self.settings.their_call_hint.is_some(),
-                        // Filter to only this QSO's pings
                         qso_started_at: self.qso_time_on.map(|t| t.to_rfc3339()),
+                        their_df_hz: self.settings.their_df_hz,
                     };
                     let et = self.event_tx.clone();
                     let db = self.second_pass_db_path.clone();
@@ -953,10 +964,14 @@ impl Fsk441App {
                                     let d: Vec<u32> = tu.chars()
                                         .filter_map(|c| c.to_digit(10)).collect();
                                     if d.len() == 2 && d[0] < d[1] {
-                                        // Only update if not already hard-confirmed
+                                        // Only update if no hard-confirmed report exists —
+                                        // check both soft state AND the Rpt Rcvd text field.
+                                        // Strong primary pings set report_rcvd; accumulator
+                                        // must never override that.
                                         let already_hard = self.soft_report_rcvd.iter()
                                             .any(|(_, s)| *s == SoftSource::Hard);
-                                        if !already_hard {
+                                        let rpt_field_set = !self.report_rcvd.trim().is_empty();
+                                        if !already_hard && !rpt_field_set {
                                             self.soft_report_rcvd = tu.chars()
                                                 .map(|c| (c, SoftSource::Soft)).collect();
                                         }
@@ -972,15 +987,12 @@ impl Fsk441App {
                             .map(|dt| dt.with_timezone(&chrono::Utc))
                             .unwrap_or_else(|_| chrono::Utc::now());
                         let hyp_chars: Vec<char> = r.hypothesis.chars().collect();
+                        // Build confirmed-position lookup for O(1) access
+                        let confirmed_pos: std::collections::HashMap<usize, bool> =
+                            r.confirmed_chars.iter().map(|&(pos, _, _)| (pos, true)).collect();
                         let mut second_pass_chars: Vec<(char, bool)> = Vec::new();
-                        let mut conf_iter = r.confirmed_chars.iter().peekable();
-                        for &hc in &hyp_chars {
-                            let confirmed = if let Some((cc, _)) = conf_iter.peek() {
-                                if *cc == hc.to_ascii_uppercase() {
-                                    conf_iter.next(); true
-                                } else { false }
-                            } else { false };
-                            // Show confirmed chars; replace unconfirmed with space
+                        for (hi, &hc) in hyp_chars.iter().enumerate() {
+                            let confirmed = confirmed_pos.contains_key(&hi);
                             let display_ch = if confirmed { hc } else { ' ' };
                             second_pass_chars.push((display_ch, confirmed));
                         }
@@ -1126,38 +1138,73 @@ impl Fsk441App {
             // Only update if the token plausibly matches the known callsign —
             // don't treat every unrecognised fragment as "their call".
             if self.settings.their_call_hint.is_some() {
-                let my  = self.settings.my_call.trim().to_uppercase();
+                let my    = self.settings.my_call.trim().to_uppercase();
                 let their = self.their_call_edit.trim().to_uppercase();
+
+                // Helper: slot confirmed fragment chars into a soft strip at
+                // their correct positions within the full known callsign.
+                // Only writes positions where the fragment actually appears —
+                // never overwrites an existing Hard char, never invents positions.
+                let slot_fragment = |strip: &mut Vec<(char, SoftSource)>,
+                                     full_call: &str,
+                                     fragment: &str| {
+                    let full: Vec<char> = full_call.chars().collect();
+                    let frag: Vec<char> = fragment.chars().collect();
+                    // Ensure strip is initialised to full call length
+                    if strip.len() != full.len() {
+                        *strip = full.iter().map(|&c| (c, SoftSource::Soft)).collect();
+                    }
+                    // Find where this fragment sits within the full call
+                    if let Some(start) = full_call.find(fragment) {
+                        let start_char = full_call[..start].chars().count();
+                        for (i, &c) in frag.iter().enumerate() {
+                            let pos = start_char + i;
+                            if pos < strip.len() && strip[pos].1 != SoftSource::Hard {
+                                strip[pos] = (c, SoftSource::Hard);
+                            }
+                        }
+                    }
+                };
+
                 for call in &entry.callsigns {
                     let call_up = call.to_uppercase();
-                    // Match my call: fragment must be a prefix of or equal to my call
                     let matches_my = call_up == my
                         || my.starts_with(&call_up)
                         || (call_up.len() >= 3 && my.contains(&call_up));
-                    // Match their call: fragment must be a prefix of or equal to their call
                     let matches_their = !their.is_empty() && (
                         call_up == their
                         || their.starts_with(&call_up)
                         || (call_up.len() >= 3 && their.contains(&call_up)));
 
                     if matches_my {
-                        let chars: Vec<(char, SoftSource)> = my.chars()
-                            .map(|c| (c, SoftSource::Hard)).collect();
-                        let current_has_hard = self.soft_my_call.iter()
-                            .any(|(_, s)| *s == SoftSource::Hard);
-                        if !current_has_hard || chars.len() > self.soft_my_call.len() {
-                            self.soft_my_call = chars;
-                        }
+                        slot_fragment(&mut self.soft_my_call, &my, &call_up);
                     } else if matches_their {
-                        let chars: Vec<(char, SoftSource)> = their.chars()
-                            .map(|c| (c, SoftSource::Hard)).collect();
-                        let current_has_hard = self.soft_their_call.iter()
-                            .any(|(_, s)| *s == SoftSource::Hard);
-                        if !current_has_hard || chars.len() > self.soft_their_call.len() {
-                            self.soft_their_call = chars;
+                        slot_fragment(&mut self.soft_their_call, &their, &call_up);
+                    }
+                }
+
+                // For threshold-passing pings also scan the raw text — the
+                // callsign parser may return a truncated token ("M2CEW" instead
+                // of "SM2CEW"). Walk the raw decode word by word.
+                if entry.passed_threshold {
+                    let raw_up = entry.raw.to_uppercase();
+                    for token in raw_up.split_whitespace() {
+                        let tok = token.trim_start_matches('R');
+                        if !their.is_empty() {
+                            let matches = tok == their
+                                || their.starts_with(tok)
+                                || (tok.len() >= 3 && their.contains(tok));
+                            if matches {
+                                slot_fragment(&mut self.soft_their_call, &their, tok);
+                            }
+                        }
+                        let matches_my = tok == my
+                            || my.starts_with(tok)
+                            || (tok.len() >= 3 && my.contains(tok));
+                        if matches_my {
+                            slot_fragment(&mut self.soft_my_call, &my, tok);
                         }
                     }
-                    // Unrecognised fragment — ignore, don't pollute the strip
                 }
                 if let Some(ref rpt) = entry.report {
                     let clean: String = rpt.trim_start_matches('R')
@@ -1791,12 +1838,12 @@ impl eframe::App for Fsk441App {
                                         ui.spacing_mut().item_spacing.x = 1.0;
                                         for i in 0..expected_len {
                                             let (ch, col) = match chars.get(i) {
-                                                // Hard = primary real-time decode — full white
+                                                // Hard = confirmed by primary real-time decode — green
                                                 Some((c, SoftSource::Hard)) =>
-                                                    (*c, egui::Color32::from_rgb(240, 240, 240)),
-                                                // Soft = accumulator/second-pass — cyan
+                                                    (*c, egui::Color32::from_rgb(80, 210, 100)),
+                                                // Soft = accumulator/second-pass only — white
                                                 Some((c, SoftSource::Soft)) =>
-                                                    (*c, egui::Color32::from_rgb(80, 200, 220)),
+                                                    (*c, egui::Color32::WHITE),
                                                 // Not yet received — dim dot
                                                 None => ('·', egui::Color32::from_gray(70)),
                                             };
@@ -1817,8 +1864,23 @@ impl eframe::App for Fsk441App {
                                     .max(self.soft_my_call.len());
                                 render_chars(ui, &self.soft_my_call, my_len);
 
-                                // Report — always 2 digits
-                                render_chars(ui, &self.soft_report_rcvd, 2);
+                                // Report — if the Rpt Rcvd field has a confirmed value,
+                                // use it as Hard (overrides accumulator). The text field
+                                // is set by the QSO state machine from strong primary decodes
+                                // and is always the authoritative ground truth.
+                                let rpt_clean = self.report_rcvd.trim()
+                                    .trim_start_matches('R').trim_start_matches('r')
+                                    .to_string();
+                                let report_chars: Vec<(char, SoftSource)> = if rpt_clean.len() >= 2
+                                    && rpt_clean.chars().all(|c| c.is_ascii_digit())
+                                {
+                                    // Hard-confirmed from Rpt Rcvd field — overrides accumulator
+                                    rpt_clean.chars().take(2)
+                                        .map(|c| (c, SoftSource::Hard)).collect()
+                                } else {
+                                    self.soft_report_rcvd.clone()
+                                };
+                                render_chars(ui, &report_chars, 2);
                             });
                         }
                     }
@@ -1900,8 +1962,8 @@ impl eframe::App for Fsk441App {
                                     mode: "FSK441".to_string(),
                                     rst_sent: rst_s.clone(),
                                     rst_rcvd: rst_r.clone(),
-                                    gridsquare: grid,
-                                    my_gridsquare: my_grid,
+                                    gridsquare: grid.clone(),
+                                    my_gridsquare: my_grid.clone(),
                                     prop_mode: "MS".to_string(),
                                     nr_pings: n_pings,
                                     peak_ccf,
@@ -1909,11 +1971,37 @@ impl eframe::App for Fsk441App {
                                 };
                                 match self.adif_logger.append(&rec) {
                                     Ok(()) => {
-                                        self.adif_log.push(rec);
+                                        self.adif_log.push(rec.clone());
                                         self.qso_logged = true;
                                         self.qso_log.push(format!(
                                             "✓ LOGGED: {} S:{} R:{} → fsk441.adi",
                                             callsign, rst_s, rst_r));
+
+                                        // UDP broadcast — WSJTX protocol
+                                        // Compatible with Logger32, N1MM+, JTAlert etc.
+                                        if self.settings.udp_log_enabled {
+                                            let log_rec = logging::LogRecord {
+                                                my_call:  self.settings.my_call.trim().to_uppercase(),
+                                                my_grid:  my_grid.clone(),
+                                                dx_call:  callsign.clone(),
+                                                dx_grid:  grid.clone(),
+                                                freq_hz:  self.rig_freq_hz.unwrap_or(144_348_000),
+                                                mode:     "FSK441".into(),
+                                                rst_sent: rst_s.clone(),
+                                                rst_rcvd: rst_r.clone(),
+                                                time_on:  time_on,
+                                                time_off: now,
+                                                comment:  format!("FSK441+ peak CCF={}", peak_ccf),
+                                                prop_mode: "MS".into(),
+                                            };
+                                            let host = self.settings.udp_log_host.clone();
+                                            let port = self.settings.udp_log_port;
+                                            self._runtime.spawn(async move {
+                                                tokio::task::spawn_blocking(move || {
+                                                    logging::broadcast(&host, port, &log_rec);
+                                                }).await.ok();
+                                            });
+                                        }
                                     }
                                     Err(e) => { self.qso_log.push(format!("✗ Log failed: {}", e)); }
                                 }
@@ -2018,11 +2106,10 @@ impl eframe::App for Fsk441App {
                         self.halt_tx();
                         self.active_tx_idx = None;
                         self.qso = QsoState::Idle;
-                        // Release QSO constraint so run_engine reverts to normal RX decoding
-                        self.settings.their_call_hint = None;
-                        self.settings.their_df_hz = None;
+                        // Do NOT clear their_call_hint, their_df_hz, qso_time_on or qso_logged —
+                        // the QSO panel must stay visible so LOG QSO remains accessible.
+                        // Only Clear resets the QSO context entirely.
                         let _ = self.settings_watch_tx.send(self.settings.clone());
-                        self.qso_time_on = None;
                         self.qso_log.push("STOPPED".to_string());
                     }
                     if ui.button(egui::RichText::new("⟳ Clear")
@@ -2490,6 +2577,18 @@ impl eframe::App for Fsk441App {
                     let display_indices: Vec<usize> = (0..self.decodes.len())
                         .filter(|&i| !self.decodes[i].is_accumulated)
                         .collect();
+                    // Snapshot hard-confirmed chars once per frame for trellis colouring.
+                    // Any char that has been confirmed by a primary decode (Hard source)
+                    // in the QSO progress strip turns green in trellis rows; trellis-only
+                    // confirmed chars stay white; unconfirmed trellis chars stay dim grey.
+                    let hard_chars: std::collections::HashSet<char> =
+                        self.soft_their_call.iter()
+                            .chain(self.soft_report_rcvd.iter())
+                            .chain(self.soft_my_call.iter())
+                            .filter(|(_, s)| *s == SoftSource::Hard)
+                            .map(|(c, _)| c.to_ascii_uppercase())
+                            .collect();
+
                     for i in row_range {
                         let Some(&di) = display_indices.get(i) else { continue; };
                         let e   = &self.decodes[di];
@@ -2540,7 +2639,7 @@ impl eframe::App for Fsk441App {
                                 egui::RichText::new(&header)
                                     .monospace()
                                     .italics()
-                                    .color(egui::Color32::from_rgb(80, 200, 220))
+                                    .color(egui::Color32::from_gray(130))
                             } else if !in_qso {
                                 // Slot 0: faint warm amber tint on timestamp
                                 // Slot 1: faint cool blue tint on timestamp
@@ -2573,10 +2672,12 @@ impl eframe::App for Fsk441App {
                             // Second pass: render hypothesis with confirmed chars bright, unconfirmed dim
                             if e.is_second_pass {
                                 for (ch, confirmed) in &e.second_pass_chars {
-                                    let col = if *confirmed {
-                                        egui::Color32::from_rgb(80, 220, 240) // bright cyan = confirmed
+                                    let col = if !confirmed {
+                                        egui::Color32::from_gray(60)  // dim = unconfirmed trellis
+                                    } else if hard_chars.contains(&ch.to_ascii_uppercase()) {
+                                        egui::Color32::from_rgb(80, 210, 100)  // green = hard-confirmed
                                     } else {
-                                        egui::Color32::from_rgb(40, 120, 140) // dim cyan = unconfirmed
+                                        egui::Color32::WHITE  // white = trellis-only confirmed
                                     };
                                     let rt = egui::RichText::new(ch.to_string())
                                         .monospace().italics().color(col);
@@ -2586,14 +2687,22 @@ impl eframe::App for Fsk441App {
                             } else {
 
                             let conf_trim = 0.35f32;
-                            let first = chars.iter().enumerate()
-                                .find(|(ci, _)| confs.get(*ci).copied().unwrap_or(0.0) >= conf_trim)
-                                .map(|(ci, _)| ci)
-                                .unwrap_or(0);
-                            let last = chars.iter().enumerate().rev()
-                                .find(|(ci, _)| confs.get(*ci).copied().unwrap_or(0.0) >= conf_trim)
-                                .map(|(ci, _)| ci)
-                                .unwrap_or(chars.len().saturating_sub(1));
+                            // Threshold-passing pings: show the full decode — don't trim.
+                            // The trim exists to strip noise flanks on weak sub-threshold
+                            // pings. For strong pings the whole decode is meaningful.
+                            let (first, last) = if e.passed_threshold {
+                                (0, chars.len().saturating_sub(1))
+                            } else {
+                                let f = chars.iter().enumerate()
+                                    .find(|(ci, _)| confs.get(*ci).copied().unwrap_or(0.0) >= conf_trim)
+                                    .map(|(ci, _)| ci)
+                                    .unwrap_or(0);
+                                let l = chars.iter().enumerate().rev()
+                                    .find(|(ci, _)| confs.get(*ci).copied().unwrap_or(0.0) >= conf_trim)
+                                    .map(|(ci, _)| ci)
+                                    .unwrap_or(chars.len().saturating_sub(1));
+                                (f, l)
+                            };
                             // If trimmed significantly, show ellipsis indicator
                             let trimmed_front = first > 2;
                             let trimmed_back  = last + 3 < chars.len();
@@ -2963,6 +3072,44 @@ impl eframe::App for Fsk441App {
                             .color(egui::Color32::from_gray(140))
                             .italics()
                             .size(11.0));
+                        ui.end_row();
+                    });
+
+                    // ── Logging ───────────────────────────────────────────
+                    ui.separator();
+                    ui.heading("Logging");
+                    egui::Grid::new("logging").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+
+                        // Local ADIF file
+                        ui.checkbox(&mut self.settings.adif_log_enabled, "Append to local ADIF file");
+                        ui.end_row();
+                        ui.label("ADIF file path:");
+                        ui.text_edit_singleline(&mut self.settings.adif_log_path);
+                        ui.end_row();
+
+                        ui.label("");
+                        ui.label(egui::RichText::new("One QSO per LOG QSO press, appended to this file")
+                            .color(egui::Color32::from_gray(140)).italics().size(11.0));
+                        ui.end_row();
+
+                        // UDP broadcast
+                        ui.separator(); ui.separator(); ui.end_row();
+                        ui.checkbox(&mut self.settings.udp_log_enabled, "UDP broadcast (WSJTX protocol)");
+                        ui.end_row();
+                        ui.label("");
+                        ui.label(egui::RichText::new("Compatible with Logger32, N1MM+, JTAlert, DX Lab, HRD")
+                            .color(egui::Color32::from_gray(140)).italics().size(11.0));
+                        ui.end_row();
+                        ui.label("UDP host:");
+                        ui.text_edit_singleline(&mut self.settings.udp_log_host);
+                        ui.end_row();
+                        ui.label("UDP port:");
+                        let mut port_str = self.settings.udp_log_port.to_string();
+                        if ui.text_edit_singleline(&mut port_str).changed() {
+                            if let Ok(p) = port_str.parse::<u16>() {
+                                self.settings.udp_log_port = p;
+                            }
+                        }
                         ui.end_row();
                     });
 
@@ -3584,6 +3731,15 @@ fn config_path() -> PathBuf {
     p
 }
 
+fn default_adif_path() -> String {
+    let mut p = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    p.push(".fsk441");
+    p.push("log");
+    std::fs::create_dir_all(&p).ok();
+    p.push("fsk441.adif");
+    p.to_string_lossy().into_owned()
+}
+
 fn save_config(s: &Settings) {
     let period = match s.period {
         Period::TxFirst    => "first",
@@ -3598,7 +3754,7 @@ fn save_config(s: &Settings) {
         PttMethod::VoxOnly   => "vox",
     };
     let data = format!(
-        "my_call={}\nmy_loc={}\ninput={}\noutput={}\nrig_model={}\nrig_port={}\nrig_baud={}\nhamlib_enabled={}\nperiod={}\ncty_path={}\nmax_km={}\nmin_ccf={}\ntx_level={}\nant_bw_horiz={}\nant_bw_vert={}\nnf_margin={}\nsave_max_data={}\nptt_method={}\nptt_serial_port={}\n",
+        "my_call={}\nmy_loc={}\ninput={}\noutput={}\nrig_model={}\nrig_port={}\nrig_baud={}\nhamlib_enabled={}\nperiod={}\ncty_path={}\nmax_km={}\nmin_ccf={}\ntx_level={}\nant_bw_horiz={}\nant_bw_vert={}\nnf_margin={}\nsave_max_data={}\nptt_method={}\nptt_serial_port={}\nadif_log_enabled={}\nadif_log_path={}\nudp_log_enabled={}\nudp_log_host={}\nudp_log_port={}\n",
         s.my_call,
         s.my_loc,
         s.sel_in.as_deref().unwrap_or(""),
@@ -3618,6 +3774,11 @@ fn save_config(s: &Settings) {
         s.save_max_data,
         ptt_method_str,
         s.ptt_serial_port,
+        s.adif_log_enabled,
+        s.adif_log_path,
+        s.udp_log_enabled,
+        s.udp_log_host,
+        s.udp_log_port,
     );
     if let Err(e) = std::fs::write(config_path(), data) {
         log::warn!("Failed to save config: {}", e);
@@ -3667,6 +3828,11 @@ fn load_config() -> Settings {
                 _            => PttMethod::HamlibCat,
             },
             "ptt_serial_port" => s.ptt_serial_port = v.to_string(),
+            "adif_log_enabled" => s.adif_log_enabled = v == "true",
+            "adif_log_path"   => s.adif_log_path = v.to_string(),
+            "udp_log_enabled" => s.udp_log_enabled = v == "true",
+            "udp_log_host"    => s.udp_log_host = v.to_string(),
+            "udp_log_port"    => s.udp_log_port = v.parse().unwrap_or(2237),
             _ => {}
         }
     }

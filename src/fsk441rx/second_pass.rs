@@ -85,6 +85,10 @@ pub struct QsoContext {
     /// Used to filter analysis_pings to only this QSO's data.
     /// None = no filter (load all).
     pub qso_started_at: Option<String>,
+    /// Known DF of their signal in Hz — learned from first threshold-passing ping.
+    /// When Some, only DF buckets within ±50Hz of this value are scored.
+    /// Eliminates noise buckets at other DFs, focusing trellis energy on real signal.
+    pub their_df_hz: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,8 +123,10 @@ pub struct SecondPassResult {
     pub n_confirmed:     usize,
     /// Chars that could be checked (in our charset map)
     pub n_checked:       usize,
-    /// (char, energy) pairs — only entries where energy > noise_floor
-    pub confirmed_chars: Vec<(char, f32)>,
+    /// (hyp_pos, char, energy) — only positions where accumulated energy > noise_floor.
+    /// hyp_pos is the 0-based index into the hypothesis string.
+    /// GOLDEN RULE: every entry here represents REAL received energy, never invented.
+    pub confirmed_chars: Vec<(usize, char, f32)>,
     /// Original primary decoder output (partial/empty)
     pub raw_decode:      String,
 }
@@ -303,7 +309,7 @@ fn score_accumulated(
     acc:          &AccumulatedProbs,
     hypothesis:   &str,
     signal_floor: f32,  // per-ping threshold (e.g. adaptive_conf_threshold)
-) -> (usize, usize, Vec<(char, f32)>, f32, usize) {
+) -> (usize, usize, Vec<(usize, char, f32)>, f32, usize) {
     if acc.n_chars == 0 || acc.n_pings == 0 {
         return (0, 0, vec![], 0.0, 0);
     }
@@ -323,14 +329,14 @@ fn score_accumulated(
 
     let mut best_confirmed = 0usize;
     let mut best_checked   = 0usize;
-    let mut best_chars:    Vec<(char, f32)> = Vec::new();
+    let mut best_chars:    Vec<(usize, char, f32)> = Vec::new();
     let mut best_space_score = 0.0f32;
     let mut best_offset    = 0usize;
 
     for offset in 0..hyp_len {
         let mut confirmed = 0usize;
         let mut checked   = 0usize;
-        let mut chars: Vec<(char, f32)> = Vec::new();
+        let mut chars: Vec<(usize, char, f32)> = Vec::new();
         let mut space_score = 0.0f32;
         let mut space_checked = 0usize;
 
@@ -370,8 +376,11 @@ fn score_accumulated(
             checked += 1;
             if energy >= effective_floor {
                 confirmed += 1;
-                // Report mean energy per ping for display
-                chars.push((c, energy / acc.n_pings as f32));
+                // hyp_pos: position within one period of the hypothesis.
+                // This is the index used by the caller to slot chars into
+                // their_call / my_call / report strips — REAL position, never invented.
+                let hyp_pos = (offset + i) % hyp_len;
+                chars.push((hyp_pos, c, energy / acc.n_pings as f32));
             }
         }
 
@@ -401,7 +410,7 @@ fn score_blob(
     blob:        &[u8],
     hypothesis:  &str,
     noise_floor: f32,
-) -> (usize, usize, Vec<(char, f32)>, usize) {
+) -> (usize, usize, Vec<(usize, char, f32)>, usize) {
     let n_pos = blob.len() / (48 * 4);
     if n_pos == 0 { return (0, 0, vec![], 0); }
     let mut acc = AccumulatedProbs::new(n_pos);
@@ -524,17 +533,38 @@ pub fn run(
         df_groups.entry(bucket).or_default().push(row);
     }
 
-    log::info!("[2PASS] {} distinct DF buckets", df_groups.len());
-
     let hypotheses = generate_hypotheses(ctx);
-    log::info!("[2PASS] {} hypotheses for stage={:?}", hypotheses.len(), ctx.stage);
+
+    log::info!("[TRELLIS] ═══════════════════════════════════════════════════");
+    log::info!("[TRELLIS] capture_id={} qso_active={} n_pings={} n_buckets={}",
+        capture_id, ctx.qso_active, rows.len(), df_groups.len());
+    log::info!("[TRELLIS] stage={:?} noise_floor={:.4} their_df={:?}Hz",
+        ctx.stage, ctx.noise_floor,
+        ctx.their_df_hz.map(|f| format!("{:+.0}", f)).unwrap_or("unknown".into()));
+    log::info!("[TRELLIS] {} hypotheses to test", hypotheses.len());
+    for (i, h) in hypotheses.iter().enumerate() {
+        log::info!("[TRELLIS]   hyp[{:02}] '{}'", i, h.trim());
+    }
+    log::info!("[TRELLIS] ───────────────────────────────────────────────────");
 
     let mut results: Vec<SecondPassResult> = Vec::new();
 
     for (bucket, group) in &df_groups {
         if group.is_empty() { continue; }
 
-        // ── Accumulate char_probs across all pings in this DF bucket ──────
+        // ── DF filter — skip buckets outside ±50Hz of known signal ───────
+        // When their_df_hz is known (learned from first threshold ping),
+        // only score the bucket containing their signal. This eliminates
+        // noise buckets at other DFs which will never accumulate real energy.
+        let bucket_hz = *bucket as f32 * 43.0;
+        if let Some(known_df) = ctx.their_df_hz {
+            if (bucket_hz - known_df).abs() > 50.0 {
+                log::debug!("[TRELLIS] DF={:+.0}Hz skipped (outside ±50Hz of known DF={:+.0}Hz)",
+                    bucket_hz, known_df);
+                continue;
+            }
+        }
+
         let max_chars = group.iter()
             .map(|r| r.char_probs.len() / (48 * 4))
             .max()
@@ -548,7 +578,6 @@ pub fn run(
         let mut best_raw = String::new();
 
         for row in group {
-            // Skip pings already well-decoded by primary decoder
             if row.validity_score >= 70 { continue; }
             acc.accumulate(&row.char_probs);
             if row.mean_confidence > best_confidence {
@@ -561,19 +590,37 @@ pub fn run(
 
         if acc.n_pings == 0 { continue; }
 
-        log::debug!("[2PASS] DF={:+}Hz: {} pings accumulated, max_chars={}",
-            bucket * 43, acc.n_pings, max_chars);
+        let effective_floor = ctx.noise_floor * acc.n_pings as f32;
+        log::info!("[TRELLIS] DF={:+}Hz  n_pings={}  max_chars={}  best_conf={:.3}  eff_floor={:.3}",
+            bucket * 43, acc.n_pings, max_chars, best_confidence, effective_floor);
+        log::info!("[TRELLIS]   best primary decode: '{}'", best_raw.trim());
 
         // ── Score accumulated vector against all hypotheses ───────────────
         let mut best_confirmed = 0usize;
         let mut best_result: Option<SecondPassResult> = None;
 
         for hyp in &hypotheses {
-            let (n_confirmed, n_checked, chars, space_score, _offset) =
+            let (n_confirmed, n_checked, chars, space_score, offset) =
                 score_accumulated(&acc, hyp, ctx.noise_floor);
 
-            // Require confirmed characters from received energy AND
-            // reasonable space framing (>0.55 = spaces broadly agree with hypothesis)
+            let gate_pass = n_confirmed >= MIN_CONFIRMED && space_score >= 0.55;
+
+            // Log every hypothesis that gets any confirmed chars, or the best
+            if n_confirmed > 0 || gate_pass {
+                log::info!("[TRELLIS]   hyp='{}' confirmed={}/{} space={:.3} offset={} {}",
+                    hyp.trim(), n_confirmed, n_checked, space_score, offset,
+                    if gate_pass { "✓ PASS" } else { "✗ fail" });
+
+                // Log per-character energy for hypotheses that pass
+                if gate_pass && !chars.is_empty() {
+                    let char_detail: String = chars.iter()
+                        .map(|(pos, c, e)| format!("[{}]{}={:.3}", pos, c, e))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    log::info!("[TRELLIS]     chars: {}", char_detail);
+                }
+            }
+
             if n_confirmed >= MIN_CONFIRMED
                 && n_confirmed > best_confirmed
                 && space_score >= 0.55
@@ -593,11 +640,14 @@ pub fn run(
             }
         }
 
+        if let Some(r) = &best_result {
+            log::info!("[TRELLIS] ★ RESULT DF={:+.0}Hz: '{}' confirmed={}/{} space_ok n_pings={}",
+                r.df_hz, r.hypothesis, r.n_confirmed, r.n_checked, acc.n_pings);
+        } else {
+            log::info!("[TRELLIS]   (no hypothesis passed gate at this DF)");
+        }
+
         if let Some(r) = best_result {
-            log::info!(
-                "[2PASS] DF={:+.0}Hz n_pings={} hyp='{}' confirmed={}/{} space_ok",
-                r.df_hz, acc.n_pings, r.hypothesis, r.n_confirmed, r.n_checked
-            );
             results.push(r);
         }
     }
@@ -607,8 +657,14 @@ pub fn run(
             .then(b.mean_confidence.partial_cmp(&a.mean_confidence).unwrap())
     });
 
-    log::info!("[2PASS] Complete: {} recoveries from {} DF buckets ({} total pings)",
+    log::info!("[TRELLIS] ═══════════════════════════════════════════════════");
+    log::info!("[TRELLIS] SUMMARY: {} result(s) from {} buckets ({} total pings)",
         results.len(), df_groups.len(), rows.len());
+    for r in &results {
+        log::info!("[TRELLIS]   '{}' DF={:+.0}Hz confirmed={}/{} conf={:.3}",
+            r.hypothesis, r.df_hz, r.n_confirmed, r.n_checked, r.mean_confidence);
+    }
+    log::info!("[TRELLIS] ═══════════════════════════════════════════════════");
 
     // During an active QSO: retain analysis_pings so next period can accumulate.
     // At QSO end (qso_active=false): delete only this capture window.
@@ -675,6 +731,7 @@ mod tests {
             retain_after_run: false,
             qso_active:     false,
             qso_started_at: None,
+            their_df_hz:    None,
         };
         let h = generate_hypotheses(&ctx);
         assert!(!h.is_empty());
@@ -698,6 +755,7 @@ mod tests {
             retain_after_run: false,
             qso_active:     false,
             qso_started_at: None,
+            their_df_hz:    None,
         };
         let h = generate_hypotheses(&ctx);
         // R26 must appear — it's in REPORTS, covered regardless of what report_sent is
